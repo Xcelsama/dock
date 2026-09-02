@@ -7,7 +7,7 @@ around.
 ## How it behaves
 
 - Anything you add (a file or a block of text) shows up in the list
-  immediately and stays there while you're on the page.
+  immediately and stays there while you're on the page. 
 - If you refresh or close the tab without saving, it's gone. Nothing
   is written anywhere unless you press **Save** on that item.
 - Pressing Save uploads the file to Supabase Storage (or writes the
