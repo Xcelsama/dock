@@ -11,13 +11,16 @@ interface Props {
   onCopy: (id: string) => void;
 }
 
+function contentUrl(item: DockItem): string | undefined {
+  if (item.remoteUrl) return item.remoteUrl;
+  if (item.localUrl) return item.localUrl;
+  if (item.content) return `data:${item.mime ?? "application/octet-stream"};base64,${item.content}`;
+  if (item.text) return URL.createObjectURL(new Blob([item.text], { type: "text/plain" }));
+  return undefined;
+}
+
 export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
-  const downloadHref =
-    item.remoteUrl ??
-    item.localUrl ??
-    (item.text
-      ? URL.createObjectURL(new Blob([item.text], { type: "text/plain" }))
-      : undefined);
+  const href = contentUrl(item);
 
   return (
     <div className="flex items-start gap-3 rounded-md border border-border bg-surface p-3">
@@ -37,9 +40,9 @@ export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
           <p className="mt-1 line-clamp-2 text-xs text-muted">{item.text}</p>
         )}
 
-        {item.kind === "image" && item.localUrl && (
+        {item.kind === "image" && href && (
           <img
-            src={item.localUrl}
+            src={href}
             alt={item.name}
             className="mt-2 max-h-40 rounded-sm border border-border object-contain"
           />
@@ -62,9 +65,9 @@ export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
               </button>
             )}
 
-            {downloadHref && (
+            {href && (
               <a
-                href={downloadHref}
+                href={href}
                 download={item.kind === "text" ? `${item.name}.txt` : item.name}
                 className="text-xs text-muted hover:text-ink"
               >
@@ -92,9 +95,7 @@ export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
           </div>
         </div>
 
-        {item.error && (
-          <p className="mt-2 text-xs text-warn">{item.error}</p>
-        )}
+        {item.error && <p className="mt-2 text-xs text-warn">{item.error}</p>}
       </div>
     </div>
   );
@@ -108,9 +109,16 @@ function StatusBadge({ item }: { item: DockItem }) {
       </span>
     );
   }
+  if (item.broadcast) {
+    return (
+      <span className="rounded-sm bg-surfaceRaised px-1.5 py-0.5 text-[11px] text-muted">
+        Live on your other devices, not saved yet
+      </span>
+    );
+  }
   return (
     <span className="rounded-sm bg-surfaceRaised px-1.5 py-0.5 text-[11px] text-muted">
-      Not saved, clears when you leave
+      This device only, clears when you leave
     </span>
   );
 }
