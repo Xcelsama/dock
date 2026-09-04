@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { DockItem } from "@/lib/types";
 import { formatBytes, formatTime } from "@/lib/format";
 import { KindIcon } from "./icons";
@@ -11,16 +12,76 @@ interface Props {
   onCopy: (id: string) => void;
 }
 
-function contentUrl(item: DockItem): string | undefined {
+function previewUrl(item: DockItem): string | undefined {
   if (item.remoteUrl) return item.remoteUrl;
   if (item.localUrl) return item.localUrl;
   if (item.content) return `data:${item.mime ?? "application/octet-stream"};base64,${item.content}`;
-  if (item.text) return URL.createObjectURL(new Blob([item.text], { type: "text/plain" }));
   return undefined;
 }
 
+function triggerDownload(url: string, filename: string) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
-  const href = contentUrl(item);
+  const href = previewUrl(item);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  const filename = item.kind === "text" ? `${item.name}.txt` : item.name;
+
+  async function handleDownload() {
+    setDownloadError(null);
+
+    // Text items: build the file fresh from the in-memory string.
+    if (item.kind === "text" && item.text) {
+      const url = URL.createObjectURL(new Blob([item.text], { type: "text/plain" }));
+      triggerDownload(url, filename);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      return;
+    }
+
+    // Local blob: or data: URLs already honor the download attribute,
+    // no fetch needed.
+    if (item.localUrl) {
+      triggerDownload(item.localUrl, filename);
+      return;
+    }
+    if (item.content) {
+      triggerDownload(
+        `data:${item.mime ?? "application/octet-stream"};base64,${item.content}`,
+        filename
+      );
+      return;
+    }
+
+    // Saved items live on the Supabase storage domain, a different
+    // origin than the site itself, so the browser ignores `download`
+    // on a plain link to it and just opens the file instead. Fetching
+    // the bytes first and downloading from that in-memory copy avoids
+    // the cross-origin restriction.
+    if (item.remoteUrl) {
+      setDownloading(true);
+      try {
+        const res = await fetch(item.remoteUrl);
+        if (!res.ok) throw new Error("Download failed");
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        triggerDownload(url, filename);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch {
+        setDownloadError("Couldn't download, opening it instead.");
+        window.open(item.remoteUrl, "_blank");
+      } finally {
+        setDownloading(false);
+      }
+    }
+  }
 
   return (
     <div className="flex items-start gap-3 rounded-md border border-border bg-surface p-3">
@@ -65,15 +126,13 @@ export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
               </button>
             )}
 
-            {href && (
-              <a
-                href={href}
-                download={item.kind === "text" ? `${item.name}.txt` : item.name}
-                className="text-xs text-muted hover:text-ink"
-              >
-                Download
-              </a>
-            )}
+            <button
+              onClick={handleDownload}
+              disabled={downloading}
+              className="text-xs text-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {downloading ? "Downloading…" : "Download"}
+            </button>
 
             {!item.saved && (
               <button
@@ -95,7 +154,9 @@ export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
           </div>
         </div>
 
-        {item.error && <p className="mt-2 text-xs text-warn">{item.error}</p>}
+        {(item.error || downloadError) && (
+          <p className="mt-2 text-xs text-warn">{item.error ?? downloadError}</p>
+        )}
       </div>
     </div>
   );
