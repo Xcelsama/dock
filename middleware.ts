@@ -1,0 +1,46 @@
+import { NextRequest, NextResponse } from "next/server";
+
+export const AUTH_COOKIE = "dock_auth";
+
+// Simple, dependency-free signature so the cookie can't just be forged by
+// setting "dock_auth=true" manually. Value = sha256(password + ":" + secret).
+async function expectedCookieValue(): Promise<string | null> {
+  const password = process.env.SITE_PASSWORD;
+  if (!password) return null;
+  const secret = process.env.SITE_PASSWORD_SECRET || password;
+  const data = new TextEncoder().encode(`${password}:${secret}`);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Buffer.from(digest).toString("hex");
+}
+
+export async function middleware(req: NextRequest) {
+  const password = process.env.SITE_PASSWORD;
+
+  // If no password is configured, don't gate anything.
+  if (!password) {
+    return NextResponse.next();
+  }
+
+  const { pathname } = req.nextUrl;
+
+  // Always allow the gate page itself and its API route through.
+  if (pathname === "/gate" || pathname === "/api/gate") {
+    return NextResponse.next();
+  }
+
+  const expected = await expectedCookieValue();
+  const cookie = req.cookies.get(AUTH_COOKIE)?.value;
+
+  if (expected && cookie === expected) {
+    return NextResponse.next();
+  }
+
+  const gateUrl = new URL("/gate", req.url);
+  gateUrl.searchParams.set("next", pathname);
+  return NextResponse.redirect(gateUrl);
+}
+
+export const config = {
+  // Run on everything except Next's internal assets.
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|icon.png|icon-192.png|icon-512.png).*)"],
+};
