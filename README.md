@@ -2,7 +2,7 @@
 
 A small tool for moving files and text between your own devices. Drop
 something in on your phone, pick it up on your PC, or the other way
-around.
+around. 
 
 ## How it behaves
 
