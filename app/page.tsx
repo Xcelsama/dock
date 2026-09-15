@@ -95,7 +95,9 @@ export default function Page() {
   // locally (added on this device) are left alone so we don't clobber
   // the in-memory File or object URL they carry.
   const loadLive = useCallback(async () => {
-    const res = await fetch("/api/items", { cache: "no-store" });
+    const known = Object.keys(itemsRef.current);
+    const qs = known.length ? `?known=${known.join(",")}` : "";
+    const res = await fetch(`/api/items${qs}`, { cache: "no-store" });
     if (!res.ok) return;
     const { items: records } = (await res.json()) as { items: RelayRecord[] };
 
