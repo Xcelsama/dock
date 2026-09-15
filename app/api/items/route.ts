@@ -8,7 +8,7 @@ import {
 } from "@/lib/redis";
 import { RelayRecord } from "@/lib/types";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   if (!redis) {
     return NextResponse.json({ items: [] as RelayRecord[] });
   }
@@ -18,7 +18,20 @@ export async function GET() {
     return NextResponse.json({ items: [] as RelayRecord[] });
   }
 
-  const keys = ids.map((id) => `${ITEM_PREFIX}${id}`);
+  // The client already has full copies of items it knows about (it sends
+  // their ids via ?known=). Every poll used to re-fetch the full base64
+  // body of every live item, known or not — that's what was blowing past
+  // Upstash's max request size once a couple of photos were sitting in
+  // the relay. Now we only mget the ones the client is actually missing.
+  const knownParam = req.nextUrl.searchParams.get("known") ?? "";
+  const known = new Set(knownParam.split(",").filter(Boolean));
+  const missingIds = ids.filter((id) => !known.has(id));
+
+  if (!missingIds.length) {
+    return NextResponse.json({ items: [] as RelayRecord[] });
+  }
+
+  const keys = missingIds.map((id) => `${ITEM_PREFIX}${id}`);
   const raw = await redis.mget<(RelayRecord | null)[]>(...keys);
 
   const items: RelayRecord[] = [];
@@ -26,7 +39,7 @@ export async function GET() {
 
   raw.forEach((value, i) => {
     if (value) items.push(value);
-    else stale.push(ids[i]);
+    else stale.push(missingIds[i]);
   });
 
   // Redis already expired the stray keys via TTL, this just tidies the
