@@ -31,16 +31,31 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ items: [] as RelayRecord[] });
   }
 
-  const keys = missingIds.map((id) => `${ITEM_PREFIX}${id}`);
-  const raw = await redis.mget<(RelayRecord | null)[]>(...keys);
+  // Fetching everything missing in one mget is what blew past Upstash's
+  // 10MB max request size once the backlog got big — a giant mget just
+  // fails outright, and since nothing gets delivered, nothing ever
+  // becomes "known," so the same oversized batch gets retried forever.
+  // Instead, pull items one at a time up to a safe byte budget. Whatever
+  // doesn't fit this round simply stays "missing" and gets picked up on
+  // the next poll, a few seconds later — so it self-heals over a couple
+  // of cycles no matter how large the backlog is, instead of failing.
+  const SAFE_RESPONSE_BYTES = 7 * 1024 * 1024; // headroom under the 10MB cap
 
   const items: RelayRecord[] = [];
   const stale: string[] = [];
+  let approxBytes = 0;
 
-  raw.forEach((value, i) => {
-    if (value) items.push(value);
-    else stale.push(missingIds[i]);
-  });
+  for (const id of missingIds) {
+    if (approxBytes >= SAFE_RESPONSE_BYTES) break;
+
+    const value = await redis.get<RelayRecord | null>(`${ITEM_PREFIX}${id}`);
+    if (!value) {
+      stale.push(id);
+      continue;
+    }
+    items.push(value);
+    approxBytes += JSON.stringify(value).length;
+  }
 
   // Redis already expired the stray keys via TTL, this just tidies the
   // index. Not awaited on purpose, doesn't need to hold up the response.
