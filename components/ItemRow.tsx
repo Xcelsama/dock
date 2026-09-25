@@ -32,29 +32,68 @@ function triggerDownload(url: string, filename: string) {
   a.remove();
 }
 
-function previewUrl(item: DockItem): string | undefined {
-  if (item.remoteUrl) return item.remoteUrl;
-  if (item.localUrl) return item.localUrl;
-  if (item.content) return `data:${item.mime ?? "application/octet-stream"};base64,${item.content}`;
-  return undefined;
-}
+export default function ItemRow({
+  item,
+  onSave,
+  onRemove,
+  onCopy,
+  variant = "default",
+  onRestore,
+  onPurge,
+}: Props) {
+  const href = previewUrl(item);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
-function triggerDownload(url: string, filename: string) {
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-}
+  const filename = item.kind === "text" ? `${item.name}.txt` : item.name;
 
-export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
-  const downloadHref =
-    item.remoteUrl ??
-    item.localUrl ??
-    (item.text
-      ? URL.createObjectURL(new Blob([item.text], { type: "text/plain" }))
-      : undefined);
+  async function handleDownload() {
+    setDownloadError(null);
+
+    // Text items: build the file fresh from the in-memory string.
+    if (item.kind === "text" && item.text) {
+      const url = URL.createObjectURL(new Blob([item.text], { type: "text/plain" }));
+      triggerDownload(url, filename);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      return;
+    }
+
+    // Local blob: or data: URLs already honor the download attribute,
+    // no fetch needed.
+    if (item.localUrl) {
+      triggerDownload(item.localUrl, filename);
+      return;
+    }
+    if (item.content) {
+      triggerDownload(
+        `data:${item.mime ?? "application/octet-stream"};base64,${item.content}`,
+        filename
+      );
+      return;
+    }
+
+    // Saved items are served via a short-lived signed URL on a
+    // different origin than the site itself, so the browser ignores
+    // `download` on a plain link to it and just opens the file instead.
+    // Fetching the bytes first and downloading from that in-memory copy
+    // avoids the cross-origin restriction.
+    if (item.remoteUrl) {
+      setDownloading(true);
+      try {
+        const res = await fetch(item.remoteUrl);
+        if (!res.ok) throw new Error("Download failed");
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        triggerDownload(url, filename);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch {
+        setDownloadError("Couldn't download, opening it instead.");
+        window.open(item.remoteUrl, "_blank");
+      } finally {
+        setDownloading(false);
+      }
+    }
+  }
 
   return (
     <div className="flex items-start gap-3 rounded-md border border-border bg-surface p-3">
@@ -99,25 +138,43 @@ export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
               </button>
             )}
 
-            {downloadHref && (
-              <a
-                href={downloadHref}
-                download={item.kind === "text" ? `${item.name}.txt` : item.name}
-                className="text-xs text-muted hover:text-ink"
-              >
-                Download
-              </a>
-            )}
+            <button
+              onClick={handleDownload}
+              disabled={downloading}
+              className="text-xs text-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {downloading ? "Downloading…" : "Download"}
+            </button>
 
-            {!item.saved && (
-              <button
-                onClick={() => onSave(item.id)}
-                disabled={item.saving}
-                className="text-xs font-medium text-accent hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {item.saving ? "Saving…" : "Save"}
-              </button>
-            )}
+            {variant === "trash" ? (
+              <>
+                <button
+                  onClick={() => onRestore?.(item.id)}
+                  disabled={item.removing}
+                  className="flex items-center gap-1 text-xs font-medium text-accent hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <RestoreIcon />
+                  Restore
+                </button>
+                <button
+                  onClick={() => onPurge?.(item.id)}
+                  disabled={item.removing}
+                  className="text-xs text-muted hover:text-warn disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {item.removing ? "Deleting…" : "Delete forever"}
+                </button>
+              </>
+            ) : (
+              <>
+                {!item.saved && (
+                  <button
+                    onClick={() => onSave(item.id)}
+                    disabled={item.saving}
+                    className="text-xs font-medium text-accent hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {item.saving ? "Saving…" : "Save"}
+                  </button>
+                )}
 
                 <button
                   onClick={() => onRemove(item.id)}

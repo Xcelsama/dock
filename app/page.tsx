@@ -4,176 +4,431 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Dropzone from "@/components/Dropzone";
 import TextComposer from "@/components/TextComposer";
 import ItemRow from "@/components/ItemRow";
-import { DockItem } from "@/lib/types";
+import ShareQr from "@/components/ShareQr";
+import { DockItem, RelayRecord, SavedRecord } from "@/lib/types";
 import { kindFromFile } from "@/lib/format";
-import { supabase, supabaseConfigured, BUCKET, TABLE } from "@/lib/supabase";
+import { fileToBase64, base64ToBlob } from "@/lib/base64";
+import { MAX_BROADCAST_BYTES } from "@/lib/relay-limits";
+
+const POLL_MS = 4000;
+
+const TTL_OPTIONS = [
+  { label: "1 hour", value: 60 * 60 },
+  { label: "24 hours", value: 24 * 60 * 60 },
+  { label: "7 days", value: 7 * 24 * 60 * 60 },
+];
 
 function uid() {
   return crypto.randomUUID();
 }
 
+function mapSavedRecord(row: SavedRecord): DockItem {
+  return {
+    id: row.id,
+    kind: row.kind,
+    name: row.name,
+    size: row.size,
+    mime: row.mime,
+    createdAt: row.createdAt,
+    saved: true,
+    broadcast: false,
+    deletedAt: row.deletedAt,
+    saving: false,
+    removing: false,
+    error: null,
+    localUrl: null,
+    file: null,
+    text: row.textContent,
+    content: null,
+    remoteUrl: row.remoteUrl,
+    storageId: row.id,
+    storagePath: row.storagePath,
+  };
+}
+
 export default function Page() {
-  const [items, setItems] = useState<DockItem[]>([]);
-  const [loadingSaved, setLoadingSaved] = useState(true);
+  const [view, setView] = useState<"home" | "trash">("home");
+  // Kept as a ref so the polling interval below (set up once on mount)
+  // always checks the current tab without needing to be torn down and
+  // rebuilt every time the user switches tabs.
+  const viewRef = useRef(view);
+  viewRef.current = view;
+
+  const [query, setQuery] = useState("");
+  const [ttlSeconds, setTtlSeconds] = useState(TTL_OPTIONS[1].value);
+
+  const [items, setItems] = useState<Record<string, DockItem>>({});
+  const [loading, setLoading] = useState(true);
+  const [liveConfigured, setLiveConfigured] = useState(true);
+  const [supabaseConfigured, setSupabaseConfigured] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [hasMoreSaved, setHasMoreSaved] = useState(false);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const savedCursorRef = useRef<string | null>(null);
 
-  // Load previously saved items from Supabase on first render. These are
-  // the only items that survive a refresh, since everything else lives
-  // in component state until it's explicitly saved.
-  useEffect(() => {
-    async function load() {
-      if (!supabase) {
-        setLoadingSaved(false);
+  const [trashItems, setTrashItems] = useState<Record<string, DockItem>>({});
+  const [trashLoading, setTrashLoading] = useState(false);
+  const [hasMoreTrash, setHasMoreTrash] = useState(false);
+  const trashRef = useRef(trashItems);
+  trashRef.current = trashItems;
+  const trashCursorRef = useRef<string | null>(null);
+
+  const upsert = useCallback((next: DockItem, overwrite = true) => {
+    setItems((prev) => {
+      if (prev[next.id] && !overwrite) return prev;
+      const existing = prev[next.id];
+      return {
+        ...prev,
+        [next.id]: existing ? { ...existing, ...next } : next,
+      };
+    });
+  }, []);
+
+  const drop = useCallback((id: string) => {
+    setItems((prev) => {
+      const { [id]: _removed, ...rest } = prev;
+      return rest;
+    });
+  }, []);
+
+  // Pull the permanent (non-trashed) list from our own API — never
+  // Supabase directly, see lib/supabase-admin.ts for why. `more: true`
+  // pages further back in time; a plain call refreshes the newest page
+  // without disturbing how far "Load more" has already gone.
+  const loadSaved = useCallback(
+    async (opts?: { more?: boolean }) => {
+      const more = opts?.more ?? false;
+      const before = more ? savedCursorRef.current : null;
+      const qs = new URLSearchParams();
+      if (before) qs.set("before", before);
+
+      const res = await fetch(`/api/saved?${qs.toString()}`, { cache: "no-store" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (body.error) setLoadError(body.error);
         return;
       }
-      const { data, error } = await supabase
-        .from(TABLE)
-        .select("*")
-        .order("created_at", { ascending: false });
+      const { items: records, hasMore } = (await res.json()) as {
+        items: SavedRecord[];
+        hasMore: boolean;
+      };
 
-      if (error) {
-        setLoadError(error.message);
-        setLoadingSaved(false);
-        return;
+      for (const row of records) {
+        upsert(mapSavedRecord(row), true);
       }
 
-      const saved: DockItem[] = (data ?? []).map((row) => {
-        const remoteUrl = row.storage_path
-          ? supabase!.storage.from(BUCKET).getPublicUrl(row.storage_path).data
-              .publicUrl
-          : null;
-        return {
-          id: row.id,
-          kind: row.kind,
-          name: row.name,
-          size: row.size,
-          mime: row.mime,
-          createdAt: row.created_at,
-          saved: true,
+      if (more || savedCursorRef.current === null) {
+        if (records.length) {
+          savedCursorRef.current = records[records.length - 1].createdAt;
+        }
+        setHasMoreSaved(hasMore);
+      }
+    },
+    [upsert]
+  );
+
+  // Pull whatever's currently live in the relay. Items already known
+  // locally (added on this device) are left alone so we don't clobber
+  // the in-memory File or object URL they carry.
+  const loadLive = useCallback(async () => {
+    const known = Object.keys(itemsRef.current);
+    const qs = known.length ? `?known=${known.join(",")}` : "";
+    const res = await fetch(`/api/items${qs}`, { cache: "no-store" });
+    if (!res.ok) return;
+    const { items: records } = (await res.json()) as { items: RelayRecord[] };
+
+    for (const record of records) {
+      const current = itemsRef.current[record.id];
+      if (current) continue;
+
+      upsert(
+        {
+          id: record.id,
+          kind: record.kind,
+          name: record.name,
+          size: record.size,
+          mime: record.mime,
+          createdAt: record.createdAt,
+          saved: false,
+          broadcast: true,
+          deletedAt: null,
           saving: false,
           removing: false,
           error: null,
           localUrl: null,
           file: null,
-          text: row.text_content,
-          remoteUrl,
-          storageId: row.id,
-          storagePath: row.storage_path,
-        };
+          text: record.text,
+          content: record.content,
+          remoteUrl: null,
+          storageId: null,
+          storagePath: null,
+        },
+        false
+      );
+    }
+  }, [upsert]);
+
+  const loadTrash = useCallback(async (opts?: { more?: boolean }) => {
+    const more = opts?.more ?? false;
+    const before = more ? trashCursorRef.current : null;
+    const qs = new URLSearchParams({ trash: "1" });
+    if (before) qs.set("before", before);
+
+    setTrashLoading(true);
+    try {
+      const res = await fetch(`/api/saved?${qs.toString()}`, { cache: "no-store" });
+      if (!res.ok) return;
+      const { items: records, hasMore } = (await res.json()) as {
+        items: SavedRecord[];
+        hasMore: boolean;
+      };
+
+      setTrashItems((prev) => {
+        const next = more ? { ...prev } : {};
+        for (const row of records) next[row.id] = mapSavedRecord(row);
+        return next;
       });
 
-      setItems(saved);
-      setLoadingSaved(false);
+      if (records.length) {
+        trashCursorRef.current = records[records.length - 1].createdAt;
+      }
+      setHasMoreTrash(hasMore);
+    } finally {
+      setTrashLoading(false);
     }
-    load();
   }, []);
 
-  const addFiles = useCallback((files: File[]) => {
-    const next: DockItem[] = files.map((file) => ({
-      id: uid(),
-      kind: kindFromFile(file),
-      name: file.name,
-      size: file.size,
-      mime: file.type || null,
-      createdAt: new Date().toISOString(),
-      saved: false,
-      saving: false,
-      removing: false,
-      error: null,
-      localUrl: URL.createObjectURL(file),
-      file,
-      text: null,
-      remoteUrl: null,
-      storageId: null,
-      storagePath: null,
-    }));
-    setItems((prev) => [...next, ...prev]);
-  }, []);
+  useEffect(() => {
+    if (view !== "trash") return;
+    trashCursorRef.current = null;
+    loadTrash();
+  }, [view, loadTrash]);
 
-  const addText = useCallback((text: string) => {
-    const item: DockItem = {
-      id: uid(),
-      kind: "text",
-      name: text.length > 40 ? `${text.slice(0, 40)}…` : text,
-      size: new Blob([text]).size,
-      mime: "text/plain",
-      createdAt: new Date().toISOString(),
-      saved: false,
-      saving: false,
-      removing: false,
-      error: null,
-      localUrl: null,
-      file: null,
-      text,
-      remoteUrl: null,
-      storageId: null,
-      storagePath: null,
+  useEffect(() => {
+    let cancelled = false;
+
+    async function init() {
+      const configRes = await fetch("/api/config").catch(() => null);
+      if (configRes?.ok) {
+        const { redisConfigured, supabaseConfigured: sbConfigured } = await configRes.json();
+        if (!cancelled) {
+          setLiveConfigured(redisConfigured);
+          setSupabaseConfigured(sbConfigured);
+        }
+      }
+      await Promise.all([loadSaved(), loadLive()]);
+      if (!cancelled) setLoading(false);
+    }
+
+    init();
+
+    const interval = setInterval(() => {
+      if (viewRef.current !== "home") return;
+      loadSaved();
+      loadLive();
+    }, POLL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
     };
-    setItems((prev) => [item, ...prev]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const patchItem = useCallback((id: string, patch: Partial<DockItem>) => {
-    setItems((prev) =>
-      prev.map((it) => (it.id === id ? { ...it, ...patch } : it))
-    );
+  const broadcast = useCallback(
+    async (record: RelayRecord, itemTtlSeconds: number) => {
+      try {
+        const res = await fetch("/api/items", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...record, ttlSeconds: itemTtlSeconds }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          upsert({ ...itemsRef.current[record.id], broadcast: false, error: body.error ?? "Couldn't share live." } as DockItem);
+          return;
+        }
+        upsert({ ...itemsRef.current[record.id], broadcast: true } as DockItem);
+      } catch {
+        upsert({ ...itemsRef.current[record.id], broadcast: false, error: "Couldn't reach the live relay." } as DockItem);
+      }
+    },
+    [upsert]
+  );
+
+  const addFiles = useCallback(
+    (files: File[]) => {
+      for (const file of files) {
+        const id = uid();
+        const createdAt = new Date().toISOString();
+        const kind = kindFromFile(file);
+
+        upsert({
+          id,
+          kind,
+          name: file.name,
+          size: file.size,
+          mime: file.type || null,
+          createdAt,
+          saved: false,
+          broadcast: false,
+          deletedAt: null,
+          saving: false,
+          removing: false,
+          error: null,
+          localUrl: URL.createObjectURL(file),
+          file,
+          text: null,
+          content: null,
+          remoteUrl: null,
+          storageId: null,
+          storagePath: null,
+        });
+
+        if (file.size <= MAX_BROADCAST_BYTES) {
+          fileToBase64(file).then((content) => {
+            broadcast(
+              {
+                id,
+                kind,
+                name: file.name,
+                size: file.size,
+                mime: file.type || null,
+                createdAt,
+                text: null,
+                content,
+              },
+              ttlSeconds
+            );
+          });
+        } else {
+          upsert({
+            ...itemsRef.current[id],
+            error: "Too large to share live, save it to send it across.",
+          } as DockItem);
+        }
+      }
+    },
+    [upsert, broadcast, ttlSeconds]
+  );
+
+  const addText = useCallback(
+    (text: string) => {
+      const id = uid();
+      const createdAt = new Date().toISOString();
+      const size = new Blob([text]).size;
+      const name = text.length > 40 ? `${text.slice(0, 40)}…` : text;
+
+      upsert({
+        id,
+        kind: "text",
+        name,
+        size,
+        mime: "text/plain",
+        createdAt,
+        saved: false,
+        broadcast: false,
+        deletedAt: null,
+        saving: false,
+        removing: false,
+        error: null,
+        localUrl: null,
+        file: null,
+        text,
+        content: null,
+        remoteUrl: null,
+        storageId: null,
+        storagePath: null,
+      });
+
+      broadcast({ id, kind: "text", name, size, mime: "text/plain", createdAt, text, content: null }, ttlSeconds);
+    },
+    [upsert, broadcast, ttlSeconds]
+  );
+
+  // Global paste-to-add: lets you paste a screenshot or a block of text
+  // straight onto the page instead of only dragging files in. Skipped
+  // while focus is inside an actual text field (the composer textarea,
+  // the gate's password box) so normal typing/pasting there isn't
+  // hijacked, and skipped outside the Home tab since there's nothing to
+  // add items to from Trash.
+  const addFilesRef = useRef(addFiles);
+  addFilesRef.current = addFiles;
+  const addTextRef = useRef(addText);
+  addTextRef.current = addText;
+
+  useEffect(() => {
+    function handlePaste(e: ClipboardEvent) {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) return;
+      if (viewRef.current !== "home") return;
+
+      const dt = e.clipboardData;
+      if (!dt) return;
+
+      const files = Array.from(dt.files ?? []);
+      if (files.length) {
+        e.preventDefault();
+        addFilesRef.current(files);
+        return;
+      }
+
+      const text = dt.getData("text/plain");
+      if (text.trim()) {
+        e.preventDefault();
+        addTextRef.current(text.trim());
+      }
+    }
+
+    window.addEventListener("paste", handlePaste);
+    return () => window.removeEventListener("paste", handlePaste);
   }, []);
 
   const saveItem = useCallback(
     async (id: string) => {
-      if (!supabase) {
-        patchItem(id, {
-          error: "Supabase isn't configured. Check your environment variables.",
-        });
+      const item = itemsRef.current[id];
+      if (!item || item.saved) return;
+
+      if (!supabaseConfigured) {
+        upsert({ ...item, error: "Supabase isn't configured yet." } as DockItem);
         return;
       }
 
-      const item = items.find((it) => it.id === id);
-      if (!item || item.saved) return;
-
-      patchItem(id, { saving: true, error: null });
+      upsert({ ...item, saving: true, error: null });
 
       try {
-        let storagePath: string | null = null;
+        const form = new FormData();
+        form.set("kind", item.kind);
+        form.set("name", item.name);
+        if (item.mime) form.set("mime", item.mime);
 
-        if (item.file) {
-          const safeName = item.file.name.replace(/[^\w.\-]+/g, "_");
-          storagePath = `${Date.now()}-${safeName}`;
-          const { error: uploadError } = await supabase.storage
-            .from(BUCKET)
-            .upload(storagePath, item.file, {
-              contentType: item.mime ?? undefined,
-              upsert: false,
-            });
-          if (uploadError) throw uploadError;
+        if (item.kind === "text" && item.text) {
+          form.set("textContent", item.text);
+        } else {
+          const blob: File | Blob | null =
+            item.file ?? (item.content ? base64ToBlob(item.content, item.mime) : null);
+          if (blob) form.set("file", blob, item.name);
         }
 
-        const { data, error: insertError } = await supabase
-          .from(TABLE)
-          .insert({
-            kind: item.kind,
-            name: item.name,
-            size: item.size,
-            mime: item.mime,
-            storage_path: storagePath,
-            text_content: item.text,
-          })
-          .select()
-          .single();
+        const res = await fetch("/api/saved", { method: "POST", body: form });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error ?? "Save failed");
 
-        if (insertError) throw insertError;
-
-        const remoteUrl = storagePath
-          ? supabase.storage.from(BUCKET).getPublicUrl(storagePath).data
-              .publicUrl
-          : null;
-
-        patchItem(id, {
+        const saved: SavedRecord = body.item;
+        upsert({
+          ...item,
           saved: true,
           saving: false,
-          storageId: data.id,
-          storagePath,
-          remoteUrl,
+          deletedAt: null,
+          remoteUrl: saved.remoteUrl,
+          storageId: saved.id,
+          storagePath: saved.storagePath,
         });
+
+        if (item.broadcast) {
+          fetch(`/api/items/${id}`, { method: "DELETE" }).catch(() => {});
+        }
       } catch (err) {
         upsert({
           ...item,
@@ -182,7 +437,7 @@ export default function Page() {
         });
       }
     },
-    [items, patchItem]
+    [upsert, supabaseConfigured]
   );
 
   // For a not-yet-saved item, Remove just clears it (it was never
@@ -203,17 +458,17 @@ export default function Page() {
         return;
       }
 
-      if (!supabase) return;
-      patchItem(id, { removing: true });
+      if (!item.storageId) return;
+      upsert({ ...item, removing: true });
 
       try {
-        if (item.storagePath) {
-          await supabase.storage.from(BUCKET).remove([item.storagePath]);
-        }
-        if (item.storageId) {
-          await supabase.from(TABLE).delete().eq("id", item.storageId);
-        }
-        setItems((prev) => prev.filter((it) => it.id !== id));
+        const res = await fetch(`/api/saved/${item.storageId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "trash" }),
+        });
+        if (!res.ok) throw new Error("Couldn't move to trash");
+        drop(id);
       } catch (err) {
         upsert({
           ...item,
@@ -222,25 +477,81 @@ export default function Page() {
         });
       }
     },
-    [items, patchItem]
+    [upsert, drop]
   );
 
-  const copyText = useCallback(
-    (id: string) => {
-      const item = items.find((it) => it.id === id);
-      if (item?.text) navigator.clipboard.writeText(item.text);
-    },
-    [items]
+  const restoreItem = useCallback(async (id: string) => {
+    const item = trashRef.current[id];
+    if (!item || !item.storageId) return;
+    setTrashItems((prev) => ({ ...prev, [id]: { ...item, removing: true } }));
+
+    try {
+      const res = await fetch(`/api/saved/${item.storageId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "restore" }),
+      });
+      if (!res.ok) throw new Error("Couldn't restore");
+      setTrashItems((prev) => {
+        const { [id]: _removed, ...rest } = prev;
+        return rest;
+      });
+    } catch (err) {
+      setTrashItems((prev) => ({
+        ...prev,
+        [id]: { ...item, removing: false, error: err instanceof Error ? err.message : "Restore failed" },
+      }));
+    }
+  }, []);
+
+  const purgeItem = useCallback(async (id: string) => {
+    const item = trashRef.current[id];
+    if (!item || !item.storageId) return;
+    setTrashItems((prev) => ({ ...prev, [id]: { ...item, removing: true } }));
+
+    try {
+      const res = await fetch(`/api/saved/${item.storageId}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Delete failed");
+      setTrashItems((prev) => {
+        const { [id]: _removed, ...rest } = prev;
+        return rest;
+      });
+    } catch (err) {
+      setTrashItems((prev) => ({
+        ...prev,
+        [id]: { ...item, removing: false, error: err instanceof Error ? err.message : "Delete failed" },
+      }));
+    }
+  }, []);
+
+  const copyText = useCallback((id: string) => {
+    const item = itemsRef.current[id];
+    if (item?.text) navigator.clipboard.writeText(item.text);
+  }, []);
+
+  const q = query.trim().toLowerCase();
+  const ordered = Object.values(items)
+    .filter(
+      (item) =>
+        !q || item.name.toLowerCase().includes(q) || (item.text?.toLowerCase().includes(q) ?? false)
+    )
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+
+  const orderedTrash = Object.values(trashItems).sort(
+    (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)
   );
 
   return (
     <main className="mx-auto flex min-h-screen max-w-2xl flex-col gap-6 px-4 py-10 sm:px-6">
-      <header>
-        <h1 className="text-lg font-semibold text-ink">Dock</h1>
-        <p className="mt-1 text-sm text-muted">
-          Send files or text from your phone, pick them up on your PC.
-          Nothing is kept unless you save it.
-        </p>
+      <header className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-lg font-semibold text-ink">Dock</h1>
+          <p className="mt-1 text-sm text-muted">
+            Send files or text from your phone, pick them up on your PC.
+            Nothing is kept for good unless you save it.
+          </p>
+        </div>
+        <ShareQr />
       </header>
 
       {!liveConfigured && (
@@ -252,8 +563,8 @@ export default function Page() {
 
       {!supabaseConfigured && (
         <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
-          Supabase environment variables are missing, so Save is disabled.
-          Files still work for this session, you just can't persist them yet.
+          Supabase isn't configured, so Save and Trash are disabled. Live
+          sharing still works without it.
         </div>
       )}
 
@@ -311,25 +622,71 @@ export default function Page() {
             </label>
           </div>
 
-      <section className="flex flex-col gap-2">
-        {loadingSaved ? (
-          <p className="py-6 text-center text-sm text-faint">Loading…</p>
-        ) : items.length === 0 ? (
-          <p className="py-6 text-center text-sm text-faint">
-            Nothing here yet. Drop a file or add some text above.
-          </p>
-        ) : (
-          items.map((item) => (
-            <ItemRow
-              key={item.id}
-              item={item}
-              onSave={saveItem}
-              onRemove={removeItem}
-              onCopy={copyText}
-            />
-          ))
-        )}
-      </section>
+          <section className="flex flex-col gap-2">
+            {loading ? (
+              <p className="py-6 text-center text-sm text-faint">Loading…</p>
+            ) : ordered.length === 0 ? (
+              <p className="py-6 text-center text-sm text-faint">
+                {q ? "No items match your search." : "Nothing here yet. Drop a file or add some text above."}
+              </p>
+            ) : (
+              <>
+                {ordered.map((item) => (
+                  <ItemRow
+                    key={item.id}
+                    item={item}
+                    onSave={saveItem}
+                    onRemove={removeItem}
+                    onCopy={copyText}
+                  />
+                ))}
+                {hasMoreSaved && !q && (
+                  <button
+                    onClick={() => loadSaved({ more: true })}
+                    className="mx-auto mt-2 text-xs text-muted underline underline-offset-2 hover:text-ink"
+                  >
+                    Load older saved items
+                  </button>
+                )}
+              </>
+            )}
+          </section>
+        </>
+      ) : (
+        <section className="flex flex-col gap-2">
+          {trashLoading && orderedTrash.length === 0 ? (
+            <p className="py-6 text-center text-sm text-faint">Loading…</p>
+          ) : orderedTrash.length === 0 ? (
+            <p className="py-6 text-center text-sm text-faint">Trash is empty.</p>
+          ) : (
+            <>
+              <p className="text-xs text-faint">
+                Items here still count as saved and take up storage until you delete them forever.
+              </p>
+              {orderedTrash.map((item) => (
+                <ItemRow
+                  key={item.id}
+                  item={item}
+                  variant="trash"
+                  onSave={saveItem}
+                  onRemove={removeItem}
+                  onCopy={copyText}
+                  onRestore={restoreItem}
+                  onPurge={purgeItem}
+                />
+              ))}
+              {hasMoreTrash && (
+                <button
+                  onClick={() => loadTrash({ more: true })}
+                  className="mx-auto mt-2 text-xs text-muted underline underline-offset-2 hover:text-ink"
+                >
+                  Load older trashed items
+                </button>
+              )}
+            </>
+          )}
+        </section>
+      )}
     </main>
   );
 }
