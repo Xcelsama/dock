@@ -10,11 +10,6 @@ export interface DockItem {
 
   /** persisted permanently in Supabase */
   saved: boolean;
-  /** currently visible to other devices via the Redis relay */
-  broadcast: boolean;
-  /** set once a saved item has been moved to Trash; null otherwise */
-  deletedAt: string | null;
-
   saving: boolean;
   removing: boolean;
   error: string | null;
@@ -34,31 +29,4 @@ export interface DockItem {
   storageId: string | null;
   /** storage object path once saved */
   storagePath: string | null;
-}
-
-export interface RelayRecord {
-  id: string;
-  kind: ItemKind;
-  name: string;
-  size: number;
-  mime: string | null;
-  createdAt: string;
-  text: string | null;
-  content: string | null;
-}
-
-/** Shape returned by /api/saved. Files no longer have a stable public
- *  URL — `remoteUrl` is a signed URL minted fresh for this response and
- *  expires within the hour, so it's never worth caching client-side. */
-export interface SavedRecord {
-  id: string;
-  kind: ItemKind;
-  name: string;
-  size: number;
-  mime: string | null;
-  createdAt: string;
-  textContent: string | null;
-  storagePath: string | null;
-  remoteUrl: string | null;
-  deletedAt: string | null;
 }
