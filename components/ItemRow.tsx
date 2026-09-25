@@ -1,23 +1,99 @@
 "use client";
 
+import { useState } from "react";
 import { DockItem } from "@/lib/types";
 import { formatBytes, formatTime } from "@/lib/format";
-import { KindIcon } from "./icons";
+import { KindIcon, RestoreIcon, TrashIcon } from "./icons";
 
 interface Props {
   item: DockItem;
   onSave: (id: string) => void;
   onRemove: (id: string) => void;
   onCopy: (id: string) => void;
+  /** Trash view: swaps Save/Remove for Restore/Delete forever. */
+  variant?: "default" | "trash";
+  onRestore?: (id: string) => void;
+  onPurge?: (id: string) => void;
 }
 
-export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
-  const downloadHref =
-    item.remoteUrl ??
-    item.localUrl ??
-    (item.text
-      ? URL.createObjectURL(new Blob([item.text], { type: "text/plain" }))
-      : undefined);
+function previewUrl(item: DockItem): string | undefined {
+  if (item.remoteUrl) return item.remoteUrl;
+  if (item.localUrl) return item.localUrl;
+  if (item.content) return `data:${item.mime ?? "application/octet-stream"};base64,${item.content}`;
+  return undefined;
+}
+
+function triggerDownload(url: string, filename: string) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+export default function ItemRow({
+  item,
+  onSave,
+  onRemove,
+  onCopy,
+  variant = "default",
+  onRestore,
+  onPurge,
+}: Props) {
+  const href = previewUrl(item);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  const filename = item.kind === "text" ? `${item.name}.txt` : item.name;
+
+  async function handleDownload() {
+    setDownloadError(null);
+
+    // Text items: build the file fresh from the in-memory string.
+    if (item.kind === "text" && item.text) {
+      const url = URL.createObjectURL(new Blob([item.text], { type: "text/plain" }));
+      triggerDownload(url, filename);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      return;
+    }
+
+    // Local blob: or data: URLs already honor the download attribute,
+    // no fetch needed.
+    if (item.localUrl) {
+      triggerDownload(item.localUrl, filename);
+      return;
+    }
+    if (item.content) {
+      triggerDownload(
+        `data:${item.mime ?? "application/octet-stream"};base64,${item.content}`,
+        filename
+      );
+      return;
+    }
+
+    // Saved items are served via a short-lived signed URL on a
+    // different origin than the site itself, so the browser ignores
+    // `download` on a plain link to it and just opens the file instead.
+    // Fetching the bytes first and downloading from that in-memory copy
+    // avoids the cross-origin restriction.
+    if (item.remoteUrl) {
+      setDownloading(true);
+      try {
+        const res = await fetch(item.remoteUrl);
+        if (!res.ok) throw new Error("Download failed");
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        triggerDownload(url, filename);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch {
+        setDownloadError("Couldn't download, opening it instead.");
+        window.open(item.remoteUrl, "_blank");
+      } finally {
+        setDownloading(false);
+      }
+    }
+  }
 
   return (
     <div className="flex items-start gap-3 rounded-md border border-border bg-surface p-3">
@@ -37,9 +113,9 @@ export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
           <p className="mt-1 line-clamp-2 text-xs text-muted">{item.text}</p>
         )}
 
-        {item.kind === "image" && item.localUrl && (
+        {item.kind === "image" && href && (
           <img
-            src={item.localUrl}
+            src={href}
             alt={item.name}
             className="mt-2 max-h-40 rounded-sm border border-border object-contain"
           />
@@ -50,7 +126,7 @@ export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
             {formatBytes(item.size)}
           </span>
 
-          <StatusBadge item={item} />
+          <StatusBadge item={item} variant={variant} />
 
           <div className="ml-auto flex items-center gap-3">
             {item.kind === "text" && (
@@ -62,45 +138,73 @@ export default function ItemRow({ item, onSave, onRemove, onCopy }: Props) {
               </button>
             )}
 
-            {downloadHref && (
-              <a
-                href={downloadHref}
-                download={item.kind === "text" ? `${item.name}.txt` : item.name}
-                className="text-xs text-muted hover:text-ink"
-              >
-                Download
-              </a>
-            )}
-
-            {!item.saved && (
-              <button
-                onClick={() => onSave(item.id)}
-                disabled={item.saving}
-                className="text-xs font-medium text-accent hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {item.saving ? "Saving…" : "Save"}
-              </button>
-            )}
-
             <button
-              onClick={() => onRemove(item.id)}
-              disabled={item.removing}
-              className="text-xs text-muted hover:text-warn disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={handleDownload}
+              disabled={downloading}
+              className="text-xs text-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {item.removing ? "Removing…" : "Remove"}
+              {downloading ? "Downloading…" : "Download"}
             </button>
+
+            {variant === "trash" ? (
+              <>
+                <button
+                  onClick={() => onRestore?.(item.id)}
+                  disabled={item.removing}
+                  className="flex items-center gap-1 text-xs font-medium text-accent hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <RestoreIcon />
+                  Restore
+                </button>
+                <button
+                  onClick={() => onPurge?.(item.id)}
+                  disabled={item.removing}
+                  className="text-xs text-muted hover:text-warn disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {item.removing ? "Deleting…" : "Delete forever"}
+                </button>
+              </>
+            ) : (
+              <>
+                {!item.saved && (
+                  <button
+                    onClick={() => onSave(item.id)}
+                    disabled={item.saving}
+                    className="text-xs font-medium text-accent hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {item.saving ? "Saving…" : "Save"}
+                  </button>
+                )}
+
+                <button
+                  onClick={() => onRemove(item.id)}
+                  disabled={item.removing}
+                  className="flex items-center gap-1 text-xs text-muted hover:text-warn disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <TrashIcon />
+                  {item.removing ? "Removing…" : item.saved ? "Move to trash" : "Remove"}
+                </button>
+              </>
+            )}
           </div>
         </div>
 
-        {item.error && (
-          <p className="mt-2 text-xs text-warn">{item.error}</p>
+        {(item.error || downloadError) && (
+          <p className="mt-2 text-xs text-warn">{item.error ?? downloadError}</p>
         )}
       </div>
     </div>
   );
 }
 
-function StatusBadge({ item }: { item: DockItem }) {
+function StatusBadge({ item, variant }: { item: DockItem; variant: "default" | "trash" }) {
+  if (variant === "trash") {
+    return (
+      <span className="rounded-sm bg-warn/10 px-1.5 py-0.5 text-[11px] text-warn">
+        In Trash
+      </span>
+    );
+  }
   if (item.saved) {
     return (
       <span className="rounded-sm bg-accentDim/20 px-1.5 py-0.5 text-[11px] text-accent">
@@ -108,9 +212,16 @@ function StatusBadge({ item }: { item: DockItem }) {
       </span>
     );
   }
+  if (item.broadcast) {
+    return (
+      <span className="rounded-sm bg-surfaceRaised px-1.5 py-0.5 text-[11px] text-muted">
+        Live on your other devices, not saved yet
+      </span>
+    );
+  }
   return (
     <span className="rounded-sm bg-surfaceRaised px-1.5 py-0.5 text-[11px] text-muted">
-      Not saved, clears when you leave
+      This device only, clears when you leave
     </span>
   );
 }

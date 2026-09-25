@@ -72,3 +72,23 @@ export function KindIcon({ kind }: { kind: ItemKind }) {
       return <FileIcon />;
   }
 }
+
+export function TrashIcon() {
+  return (
+    <svg {...common}>
+      <path d="M4 7h16" />
+      <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+      <path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13" />
+      <path d="M10 11v6M14 11v6" />
+    </svg>
+  );
+}
+
+export function RestoreIcon() {
+  return (
+    <svg {...common}>
+      <path d="M3 11a9 9 0 1 1 2.6 6.3" />
+      <path d="M3 5v6h6" />
+    </svg>
+  );
+}
