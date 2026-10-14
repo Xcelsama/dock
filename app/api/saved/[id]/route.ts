@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseAdmin, BUCKET, TABLE, signedUrlFor } from "@/lib/supabase-admin";
-import { SavedRecord } from "@/lib/types";
+import { supabaseAdmin, BUCKET, TABLE, toSavedRecord } from "@/lib/supabase-admin";
+import { bumpSavedVersion } from "@/lib/redis";
 
 // PATCH /api/saved/[id] — { action: "trash" | "restore" }
 // Soft-delete only. The row and its file stay put; deleted_at just
@@ -37,20 +37,8 @@ export async function PATCH(
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  const record: SavedRecord = {
-    id: data.id,
-    kind: data.kind,
-    name: data.name,
-    size: data.size,
-    mime: data.mime,
-    createdAt: data.created_at,
-    textContent: data.text_content,
-    storagePath: data.storage_path,
-    remoteUrl: await signedUrlFor(data.storage_path),
-    deletedAt: data.deleted_at,
-  };
-
-  return NextResponse.json({ item: record });
+  bumpSavedVersion();
+  return NextResponse.json({ item: toSavedRecord(data) });
 }
 
 // DELETE /api/saved/[id] — permanent. Removes the storage object (if
@@ -79,5 +67,6 @@ export async function DELETE(
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
+  bumpSavedVersion();
   return NextResponse.json({ ok: true });
 }
