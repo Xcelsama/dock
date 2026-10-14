@@ -22,7 +22,10 @@ function GateForm() {
       });
       const data = await res.json();
       if (data.ok) {
-        const next = searchParams.get("next") || "/";
+        // Only follow a same-site path ("/…"), never an absolute or
+        // protocol-relative URL someone put in ?next=.
+        const raw = searchParams.get("next") || "/";
+        const next = /^\/(?![\\/])/.test(raw) ? raw : "/";
         router.replace(next);
         router.refresh();
       } else {
