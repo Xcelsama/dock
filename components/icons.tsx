@@ -92,3 +92,23 @@ export function RestoreIcon() {
     </svg>
   );
 }
+
+export function SendIcon() {
+  return (
+    <svg {...common}>
+      <path d="M5 12h14" />
+      <path d="M13 6l6 6-6 6" />
+    </svg>
+  );
+}
+
+export function PairIcon() {
+  return (
+    <svg {...common}>
+      <rect x="3" y="3" width="7" height="7" rx="1" />
+      <rect x="14" y="3" width="7" height="7" rx="1" />
+      <rect x="3" y="14" width="7" height="7" rx="1" />
+      <path d="M14 14h3v3M21 14v.01M14 21h.01M17 21h4v-4" />
+    </svg>
+  );
+}
