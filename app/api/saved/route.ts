@@ -1,6 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseAdmin, BUCKET, TABLE, signedUrlFor } from "@/lib/supabase-admin";
-import { SavedRecord, ItemKind } from "@/lib/types";
+import {
+  supabaseAdmin,
+  BUCKET,
+  TABLE,
+  UUID_RE,
+  toSavedRecord,
+} from "@/lib/supabase-admin";
+import { bumpSavedVersion } from "@/lib/redis";
+import { ItemKind } from "@/lib/types";
 
 const DEFAULT_PAGE_SIZE = 30;
 const MAX_PAGE_SIZE = 100;
@@ -21,13 +28,12 @@ function isItemKind(value: unknown): value is ItemKind {
 
 // GET /api/saved?limit=30&before=<ISO timestamp>&trash=1
 // Cursor-based pagination on created_at: pass the createdAt of the last
-// item you already have as `before` to get the next page. Keeps the
-// query fast and the payload small no matter how many items pile up
-// over months of use, instead of the old "select everything, every
-// poll" approach.
+// item you already have as `before` to get the next page. No signed URLs
+// are minted here any more (that was one Supabase round trip per item per
+// poll); files are reached through /api/saved/[id]/file instead.
 export async function GET(req: NextRequest) {
   if (!supabaseAdmin) {
-    return NextResponse.json({ items: [] as SavedRecord[], hasMore: false });
+    return NextResponse.json({ items: [], hasMore: false });
   }
 
   const { searchParams } = req.nextUrl;
@@ -56,28 +62,17 @@ export async function GET(req: NextRequest) {
   const hasMore = rows.length > limit;
   const page = hasMore ? rows.slice(0, limit) : rows;
 
-  const items: SavedRecord[] = await Promise.all(
-    page.map(async (row) => ({
-      id: row.id,
-      kind: row.kind,
-      name: row.name,
-      size: row.size,
-      mime: row.mime,
-      createdAt: row.created_at,
-      textContent: row.text_content,
-      storagePath: row.storage_path,
-      remoteUrl: await signedUrlFor(row.storage_path),
-      deletedAt: row.deleted_at,
-    }))
-  );
-
-  return NextResponse.json({ items, hasMore });
+  return NextResponse.json({ items: page.map(toSavedRecord), hasMore });
 }
 
 // POST /api/saved — multipart/form-data.
-// Fields: kind, name, mime (optional), textContent (optional),
-// file (optional binary). Everything goes through the service-role
-// client server-side; the browser never touches Supabase directly.
+// Fields: id (optional client uuid, keeps the item's identity stable
+// across "local" -> "saved"), kind, name, mime (optional), textContent
+// (optional), file (optional binary). Everything goes through the
+// service-role client server-side.
+//
+// Note: on Vercel a request body is capped at ~4.5 MB, so larger files
+// can't be saved through this route (the client shows a clear message).
 export async function POST(req: NextRequest) {
   if (!supabaseAdmin) {
     return NextResponse.json(
@@ -91,6 +86,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid request." }, { status: 400 });
   }
 
+  const id = form.get("id");
   const kind = form.get("kind");
   const name = form.get("name");
   const mime = form.get("mime");
@@ -111,7 +107,10 @@ export async function POST(req: NextRequest) {
     const { error: uploadError } = await supabaseAdmin.storage
       .from(BUCKET)
       .upload(storagePath, bytes, {
-        contentType: typeof mime === "string" ? mime : file.type || undefined,
+        contentType: typeof mime === "string" && mime ? mime : file.type || undefined,
+        // Paths are unique per upload and never overwritten, so the bytes
+        // are safe for browsers to cache for a long time.
+        cacheControl: "31536000",
         upsert: false,
       });
     if (uploadError) {
@@ -124,10 +123,11 @@ export async function POST(req: NextRequest) {
   const { data, error: insertError } = await supabaseAdmin
     .from(TABLE)
     .insert({
+      ...(typeof id === "string" && UUID_RE.test(id) ? { id } : {}),
       kind,
       name,
       size,
-      mime: typeof mime === "string" ? mime : null,
+      mime: typeof mime === "string" && mime ? mime : null,
       storage_path: storagePath,
       text_content: typeof textContent === "string" ? textContent : null,
     })
@@ -135,21 +135,13 @@ export async function POST(req: NextRequest) {
     .single();
 
   if (insertError) {
+    // Don't leave an orphaned file behind if the row couldn't be written.
+    if (storagePath) {
+      await supabaseAdmin.storage.from(BUCKET).remove([storagePath]);
+    }
     return NextResponse.json({ error: insertError.message }, { status: 500 });
   }
 
-  const record: SavedRecord = {
-    id: data.id,
-    kind: data.kind,
-    name: data.name,
-    size: data.size,
-    mime: data.mime,
-    createdAt: data.created_at,
-    textContent: data.text_content,
-    storagePath: data.storage_path,
-    remoteUrl: await signedUrlFor(data.storage_path),
-    deletedAt: data.deleted_at,
-  };
-
-  return NextResponse.json({ item: record });
+  bumpSavedVersion();
+  return NextResponse.json({ item: toSavedRecord(data) });
 }
