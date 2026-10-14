@@ -30,10 +30,16 @@ export async function middleware(req: NextRequest) {
   }
 
   const gateUrl = new URL("/gate", req.url);
-  gateUrl.searchParams.set("next", pathname);
+  // Keep the query string too, or a scanned ?pair=<code> link would lose
+  // its code when the phone has to unlock first.
+  gateUrl.searchParams.set("next", pathname + req.nextUrl.search);
   return NextResponse.redirect(gateUrl);
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|icon.png|icon-192.png|icon-512.png).*)"],
+  // The manifest and touch icon are fetched by the browser/OS without cookies,
+  // so gating them would break installing Dock to a home screen.
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|icon.png|apple-icon.png|icon-192.png|icon-512.png|manifest.webmanifest).*)",
+  ],
 };

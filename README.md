@@ -18,12 +18,18 @@ around.
 - Removing a *saved* item moves it to **Trash** instead of deleting it
   outright — it still counts as saved and takes up storage until you
   delete it forever from the Trash tab, or restore it back.
-- Files bigger than 4 MB skip the live relay (Redis isn't built for
-  large blobs) and stay on the uploading device only, until you save
-  them.
-- You can paste files or text directly onto the page (Ctrl/Cmd+V), not
-  just drag-and-drop, and there's a "Scan on another device" button
-  that shows a QR code of the current page for quick phone access.
+- Files bigger than 3 MB skip the live relay (Redis isn't built for
+  large blobs) and stay on the uploading device only. Use **Send** to
+  move those directly (see below) or **Save** to keep them.
+- You can drop or paste files **anywhere on the page** (Ctrl/Cmd+V works
+  for screenshots, copied images, and files copied from your file
+  manager, even while the text box is focused). Pasted screenshots get
+  a proper timestamped name. Dropping a folder shows a hint to zip it
+  first instead of failing silently.
+- **Live sync** (checkbox next to the search box) controls whether new
+  items are copied to your other devices through the relay. Turn it off
+  to keep everything on the device it was added on and move things only
+  with Send or Save.
 - The search box filters by name/text; "Load older…" pages further
   back through saved items and Trash instead of fetching everything at
   once.
@@ -31,6 +37,39 @@ around.
 Each item's badge tells you exactly which of the three states it's
 in: **This device only**, **Live on your other devices**, **Saved**,
 or **In Trash**.
+
+## Send to another device (QR, direct)
+
+Press **Send** on any item (or **Send to device** at the top) and a QR
+code appears. Scan it with the other device's camera, it opens Dock and
+connects, and the file goes straight from one device to the other.
+**The file is never uploaded to Redis or Supabase.** It travels over an
+encrypted peer-to-peer (WebRTC) connection. No hotspot or shared Wi-Fi
+is needed; the two devices only need internet access.
+
+- No camera? The code under the QR can be typed on the other device
+  (**Send to another device > type the code**).
+- Once connected, **either device can send**, and you can keep sending
+  more files without scanning again. Closing the page ends the session.
+- After every successful transfer a popup on both devices asks whether to
+  **Save to Dock** (permanent copy in Supabase) or, on the receiving
+  device, **Download** it. If you do nothing, the file only exists in
+  that browser tab until you close it.
+- Direct transfers work for files up to 1 GB, but the receiving browser
+  holds the file in memory, so very large files can be a stretch on
+  phones. Keep the page open and the screen on while it moves (Dock
+  requests a screen wake lock while paired where the browser allows it).
+- Pairing codes are single-use, expire after 5 minutes, and only relay
+  the connection set-up (a few KB) through Upstash Redis. That is why
+  Redis is required for this feature.
+
+**When it can't connect:** most home, office and mobile networks work
+with the free public STUN servers Dock uses by default. Some mobile
+carriers and corporate networks block direct connections, and those
+pairs need a TURN relay. Set `TURN_URLS`, `TURN_USERNAME` and
+`TURN_CREDENTIAL` (see `.env.local.example`) with credentials from any
+TURN provider. The traffic stays end-to-end encrypted; the relay just
+forwards it. Without TURN, Dock shows a clear message instead of hanging.
 
 ## Setup
 
@@ -66,8 +105,9 @@ Only needed for Save and Trash.
 `NEXT_PUBLIC_` and must never be sent to the browser. Every read,
 write, and delete against Supabase happens inside this app's own API
 routes (`app/api/saved/**`), using that key server-side — the browser
-never talks to Supabase directly. Files are served through short-lived
-signed URLs minted per request, not a public bucket URL.
+never talks to Supabase directly. Files are served through `/api/saved/<id>/file`, which mints a
+short-lived signed URL on demand and redirects to it, so there is no
+public bucket URL and nothing signed is ever stored or listed.
 
 > **Upgrading from an older version of Dock?** The previous schema
 > used a client-side anon key with open Row Level Security policies —
@@ -84,6 +124,29 @@ signed URLs minted per request, not a public bucket URL.
 npm install
 npm run dev
 ```
+
+## Performance notes
+
+- The saved list no longer asks Supabase for a signed URL per item on
+  every poll. File links are stable same-origin paths that browsers can
+  cache, so images stop re-downloading every few seconds.
+- Devices only re-fetch the saved list when something actually changed
+  (a version counter in Redis), instead of on every poll.
+- Polling pauses while the tab is hidden, relaxes from 4 s to 12 s while
+  nothing changes, and refreshes immediately when you come back.
+- Your last saved list is cached in the browser (`localStorage`, names
+  and text only, never file contents) so repeat visits paint instantly
+  while fresh data loads. Clearing site data clears it.
+- The QR library and pairing UI load only when you open the pairing
+  sheet.
+
+## Known limits
+
+- **Saving files over ~4.5 MB** from the browser fails when hosted on
+  Vercel (its request-body cap applies to `/api/saved`). Dock shows a
+  clear message and the file stays on the device; Download keeps it.
+  Direct transfers themselves are not affected. Lifting this means
+  uploading straight to Supabase Storage with signed upload URLs.
 
 ## Deploying to Vercel
 
@@ -114,6 +177,9 @@ purpose rather than by omission:
   touches the Redis keys, the Supabase schema, and the access model all
   at once. Worth doing as its own focused change rather than folded in
   here.
+- **An in-app QR scanner** (the phone's own camera app already opens the
+  link, which covers most cases). Needs `BarcodeDetector`, which iOS
+  Safari lacks.
 - **Web Share Target** (showing up in your phone's native share sheet)
   — only works for an installed PWA on Chrome/Android, and needs a
   dedicated endpoint to receive the shared payload. Straightforward to
