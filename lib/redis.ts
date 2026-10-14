@@ -1,7 +1,4 @@
 import { Redis } from "@upstash/redis";
-import { MAX_BROADCAST_BYTES } from "@/lib/relay-limits";
-
-export { MAX_BROADCAST_BYTES };
 
 const url = process.env.UPSTASH_REDIS_REST_URL;
 const token = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -14,6 +11,15 @@ export const redis = redisConfigured
 
 export const INDEX_KEY = "dock:index";
 export const ITEM_PREFIX = "dock:item:";
+
+// Bumped whenever anything in Supabase changes (save / trash / restore /
+// delete). Devices see it in their regular poll and only re-fetch the saved
+// list when it moved, instead of hitting Supabase every few seconds.
+export const SAVED_VERSION_KEY = "dock:saved-version";
+
+export function bumpSavedVersion() {
+  if (redis) redis.incr(SAVED_VERSION_KEY).catch(() => {});
+}
 
 // How long an unsaved item stays visible to other devices before it
 // quietly expires, when no per-item TTL is chosen. Adjust with

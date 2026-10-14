@@ -12,6 +12,8 @@ export interface DockItem {
   saved: boolean;
   /** currently visible to other devices via the Redis relay */
   broadcast: boolean;
+  /** arrived over a direct device-to-device (QR) transfer, never touched a server */
+  viaP2p: boolean;
   /** set once a saved item has been moved to Trash; null otherwise */
   deletedAt: string | null;
 
@@ -28,12 +30,10 @@ export interface DockItem {
   /** base64 payload, present once fetched from the Redis relay */
   content: string | null;
 
-  /** public URL once persisted to Supabase storage */
+  /** same-origin URL (/api/saved/<id>/file) once persisted to Supabase */
   remoteUrl: string | null;
-  /** row id in the Supabase table once saved */
+  /** row id in the Supabase table once saved (same as `id`) */
   storageId: string | null;
-  /** storage object path once saved */
-  storagePath: string | null;
 }
 
 export interface RelayRecord {
@@ -47,9 +47,9 @@ export interface RelayRecord {
   content: string | null;
 }
 
-/** Shape returned by /api/saved. Files no longer have a stable public
- *  URL — `remoteUrl` is a signed URL minted fresh for this response and
- *  expires within the hour, so it's never worth caching client-side. */
+/** Shape returned by /api/saved. `remoteUrl` is a stable same-origin path
+ *  (never a signed URL), so it can be cached by the browser and doesn't
+ *  change between polls. */
 export interface SavedRecord {
   id: string;
   kind: ItemKind;
@@ -58,7 +58,6 @@ export interface SavedRecord {
   mime: string | null;
   createdAt: string;
   textContent: string | null;
-  storagePath: string | null;
   remoteUrl: string | null;
   deletedAt: string | null;
 }
