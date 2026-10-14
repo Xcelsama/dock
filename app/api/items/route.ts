@@ -3,44 +3,40 @@ import {
   redis,
   INDEX_KEY,
   ITEM_PREFIX,
+  SAVED_VERSION_KEY,
   TTL_SECONDS,
-  MAX_BROADCAST_BYTES,
   clampTtl,
 } from "@/lib/redis";
+import { MAX_BROADCAST_BYTES } from "@/lib/relay-limits";
 import { RelayRecord } from "@/lib/types";
+
+export const dynamic = "force-dynamic";
+
+// Items that the client is missing are fetched one at a time up to this
+// budget. A single giant mget blew past Upstash's 10 MB request cap when
+// the backlog got big; whatever doesn't fit this round is picked up on the
+// next poll, so it self-heals.
+const SAFE_RESPONSE_BYTES = 7 * 1024 * 1024;
 
 export async function GET(req: NextRequest) {
   if (!redis) {
-    return NextResponse.json({ items: [] as RelayRecord[] });
+    return NextResponse.json({ items: [] as RelayRecord[], savedVersion: null });
   }
 
-  const ids = await redis.zrange<string[]>(INDEX_KEY, 0, -1, { rev: true });
-  if (!ids.length) {
-    return NextResponse.json({ items: [] as RelayRecord[] });
-  }
+  // One round trip for both the id list and the saved-version counter.
+  const [ids, version] = await redis
+    .pipeline()
+    .zrange(INDEX_KEY, 0, -1, { rev: true })
+    .get(SAVED_VERSION_KEY)
+    .exec<[string[], number | null]>();
 
-  // The client already has full copies of items it knows about (it sends
-  // their ids via ?known=). Every poll used to re-fetch the full base64
-  // body of every live item, known or not — that's what was blowing past
-  // Upstash's max request size once a couple of photos were sitting in
-  // the relay. Now we only mget the ones the client is actually missing.
+  const savedVersion = Number(version ?? 0);
+
+  // The client sends the ids it already holds (?known=) so we only fetch
+  // bodies it's actually missing.
   const knownParam = req.nextUrl.searchParams.get("known") ?? "";
   const known = new Set(knownParam.split(",").filter(Boolean));
   const missingIds = ids.filter((id) => !known.has(id));
-
-  if (!missingIds.length) {
-    return NextResponse.json({ items: [] as RelayRecord[] });
-  }
-
-  // Fetching everything missing in one mget is what blew past Upstash's
-  // 10MB max request size once the backlog got big — a giant mget just
-  // fails outright, and since nothing gets delivered, nothing ever
-  // becomes "known," so the same oversized batch gets retried forever.
-  // Instead, pull items one at a time up to a safe byte budget. Whatever
-  // doesn't fit this round simply stays "missing" and gets picked up on
-  // the next poll, a few seconds later — so it self-heals over a couple
-  // of cycles no matter how large the backlog is, instead of failing.
-  const SAFE_RESPONSE_BYTES = 7 * 1024 * 1024; // headroom under the 10MB cap
 
   const items: RelayRecord[] = [];
   const stale: string[] = [];
@@ -59,12 +55,12 @@ export async function GET(req: NextRequest) {
   }
 
   // Redis already expired the stray keys via TTL, this just tidies the
-  // index. Not awaited on purpose, doesn't need to hold up the response.
+  // index. Not awaited on purpose.
   if (stale.length) {
     redis.zrem(INDEX_KEY, ...stale).catch(() => {});
   }
 
-  return NextResponse.json({ items });
+  return NextResponse.json({ items, savedVersion });
 }
 
 export async function POST(req: NextRequest) {
@@ -88,10 +84,7 @@ export async function POST(req: NextRequest) {
   }
 
   if (typeof size === "number" && size > MAX_BROADCAST_BYTES) {
-    return NextResponse.json(
-      { error: "Too large to share live." },
-      { status: 413 }
-    );
+    return NextResponse.json({ error: "Too large to share live." }, { status: 413 });
   }
 
   const record: RelayRecord = {
@@ -105,9 +98,8 @@ export async function POST(req: NextRequest) {
     content: content ?? null,
   };
 
-  // Caller can request a shorter or longer expiry per item (see the TTL
-  // picker in the UI). Clamped server-side so a tampered request can't
-  // pin an item in Redis indefinitely or expire it instantly.
+  // Clamped server-side so a tampered request can't pin an item in Redis
+  // indefinitely or expire it instantly.
   const ttl = ttlSeconds !== undefined ? clampTtl(ttlSeconds) : TTL_SECONDS;
 
   await redis.set(`${ITEM_PREFIX}${id}`, record, { ex: ttl });
