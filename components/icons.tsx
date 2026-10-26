@@ -112,3 +112,12 @@ export function PairIcon() {
     </svg>
   );
 }
+
+export function PinIcon({ filled = false }: { filled?: boolean }) {
+  return (
+    <svg {...common} width={14} height={14} fill={filled ? "currentColor" : "none"}>
+      <path d="M9 4h6l-1 6 3 3v1H7v-1l3-3-1-6z" />
+      <path d="M12 14v6" />
+    </svg>
+  );
+}

@@ -5,8 +5,11 @@ import {
   TABLE,
   UUID_RE,
   toSavedRecord,
+  isMissingPinColumn,
+  PIN_MIGRATION_MESSAGE,
 } from "@/lib/supabase-admin";
 import { bumpSavedVersion } from "@/lib/redis";
+import { listSavedWindow, parseSince } from "@/lib/saved-list";
 import { ItemKind } from "@/lib/types";
 
 const DEFAULT_PAGE_SIZE = 30;
@@ -26,11 +29,15 @@ function isItemKind(value: unknown): value is ItemKind {
   );
 }
 
+// GET /api/saved?since=<ISO>
+//   The home screen's list: items created on/after `since`, plus every
+//   pinned item whatever its age (see lib/saved-list.ts).
 // GET /api/saved?limit=30&before=<ISO timestamp>&trash=1
-// Cursor-based pagination on created_at: pass the createdAt of the last
-// item you already have as `before` to get the next page. No signed URLs
-// are minted here any more (that was one Supabase round trip per item per
-// poll); files are reached through /api/saved/[id]/file instead.
+//   Cursor-based pagination on created_at: pass the createdAt of the last
+//   item you already have as `before` to get the next page. Used for "Show
+//   older items" and for Trash.
+// No signed URLs are minted here (that was one Supabase round trip per item
+// per poll); files are reached through /api/saved/[id]/file instead.
 export async function GET(req: NextRequest) {
   if (!supabaseAdmin) {
     return NextResponse.json({ items: [], hasMore: false });
@@ -39,6 +46,16 @@ export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
   const trash = searchParams.get("trash") === "1";
   const before = searchParams.get("before");
+
+  const since = parseSince(searchParams.get("since"));
+  if (since && !trash && !before) {
+    const result = await listSavedWindow(since);
+    if (!result.ok) {
+      return NextResponse.json({ error: result.error }, { status: 500 });
+    }
+    return NextResponse.json(result.window);
+  }
+
   const limit = Math.min(
     MAX_PAGE_SIZE,
     Math.max(1, Number(searchParams.get("limit")) || DEFAULT_PAGE_SIZE)
@@ -68,8 +85,8 @@ export async function GET(req: NextRequest) {
 // POST /api/saved — multipart/form-data.
 // Fields: id (optional client uuid, keeps the item's identity stable
 // across "local" -> "saved"), kind, name, mime (optional), textContent
-// (optional), file (optional binary). Everything goes through the
-// service-role client server-side.
+// (optional), file (optional binary), pinned ("1" to pin it as it's saved).
+// Everything goes through the service-role client server-side.
 //
 // Note: on Vercel a request body is capped at ~4.5 MB, so larger files
 // can't be saved through this route (the client shows a clear message).
@@ -92,6 +109,7 @@ export async function POST(req: NextRequest) {
   const mime = form.get("mime");
   const textContent = form.get("textContent");
   const file = form.get("file");
+  const pinned = form.get("pinned") === "1";
 
   if (!isItemKind(kind) || typeof name !== "string" || !name) {
     return NextResponse.json({ error: "Missing fields." }, { status: 400 });
@@ -130,6 +148,7 @@ export async function POST(req: NextRequest) {
       mime: typeof mime === "string" && mime ? mime : null,
       storage_path: storagePath,
       text_content: typeof textContent === "string" ? textContent : null,
+      ...(pinned ? { pinned_at: new Date().toISOString() } : {}),
     })
     .select()
     .single();
@@ -139,9 +158,10 @@ export async function POST(req: NextRequest) {
     if (storagePath) {
       await supabaseAdmin.storage.from(BUCKET).remove([storagePath]);
     }
-    return NextResponse.json({ error: insertError.message }, { status: 500 });
+    const message = pinned && isMissingPinColumn(insertError) ? PIN_MIGRATION_MESSAGE : insertError.message;
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 
-  bumpSavedVersion();
+  await bumpSavedVersion();
   return NextResponse.json({ item: toSavedRecord(data) });
 }

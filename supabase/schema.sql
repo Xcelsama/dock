@@ -18,8 +18,26 @@ create table if not exists public.dock_items (
   -- Set when an item is moved to Trash. Null means "active". Nothing
   -- purges these automatically — a permanent delete from the Trash view
   -- is what actually removes the row and its file.
-  deleted_at timestamptz
+  deleted_at timestamptz,
+  -- Set when an item is pinned. Pinned items are always loaded and sit at
+  -- the top of the list, however old they are. Null means "not pinned".
+  pinned_at timestamptz
 );
+
+-- Already have a dock_items table from an earlier version? "create table
+-- if not exists" leaves it alone, so add the pin column to it here.
+-- (supabase/pin-migration.sql is the same thing on its own.)
+alter table public.dock_items add column if not exists pinned_at timestamptz;
+
+-- The home screen asks for two lists on every load: recent items, and
+-- pinned items. These indexes keep both quick as the table grows.
+create index if not exists dock_items_recent_idx
+  on public.dock_items (created_at desc)
+  where deleted_at is null;
+
+create index if not exists dock_items_pinned_idx
+  on public.dock_items (pinned_at desc)
+  where pinned_at is not null and deleted_at is null;
 
 alter table public.dock_items enable row level security;
 
@@ -65,3 +83,5 @@ on conflict (id) do update set public = false;
 -- 5. Redeploy. Existing rows and files keep working — old storage paths
 --    are still valid, they just get served via signed URL now instead
 --    of a public one.
+-- 6. Pinning and the faster first load: run supabase/pin-migration.sql
+--    (or simply run this whole file again, it is safe to repeat).

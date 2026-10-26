@@ -30,9 +30,19 @@ around.
   items are copied to your other devices through the relay. Turn it off
   to keep everything on the device it was added on and move things only
   with Send or Save.
-- The search box filters by name/text; "Load older…" pages further
-  back through saved items and Trash instead of fetching everything at
-  once.
+- The list shows **today and yesterday** (by your device's calendar),
+  plus anything you've pinned. That keeps the first load small however
+  much you've saved. **Show older items** at the bottom brings back
+  everything else, a page at a time.
+- **Pin** keeps an item at the top of the list, in its own **Pinned**
+  section, however old it gets and on every device. Pinning something
+  that isn't saved yet saves it first (a pin has to live somewhere
+  permanent), so it needs Supabase. Pressing **Unpin** puts it back in
+  the normal list. Trashing a pinned item keeps its pin, so Restore puts
+  it back at the top.
+- The search box filters by name/text. It looks through what's on screen;
+  if nothing from today or yesterday matches, it offers **Show older
+  items** so you can search further back.
 
 Each item's badge tells you exactly which of the three states it's
 in: **This device only**, **Live on your other devices**, **Saved**,
@@ -96,7 +106,8 @@ Only needed for Save and Trash.
 1. Create a project at [supabase.com](https://supabase.com).
 2. Open the SQL editor and run `supabase/schema.sql` from this repo.
    It creates the `dock_items` table (with a `deleted_at` column for
-   Trash) and the private `dock-files` storage bucket.
+   Trash and a `pinned_at` column for pins), its indexes, and the
+   private `dock-files` storage bucket.
 3. Fill in `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in
    `.env.local` — both found under **Project Settings > API**. Use the
    **service_role** secret, not the anon/public key.
@@ -108,6 +119,12 @@ routes (`app/api/saved/**`), using that key server-side — the browser
 never talks to Supabase directly. Files are served through `/api/saved/<id>/file`, which mints a
 short-lived signed URL on demand and redirects to it, so there is no
 public bucket URL and nothing signed is ever stored or listed.
+
+> **Already running Dock, and adding pinning?** Run
+> `supabase/pin-migration.sql` once in the Supabase SQL editor. It adds
+> the `pinned_at` column and two small indexes, and is safe to run
+> again. Until you do, Dock keeps working as before; pressing Pin just
+> explains that this one-time update is needed.
 
 > **Upgrading from an older version of Dock?** The previous schema
 > used a client-side anon key with open Row Level Security policies —
@@ -127,18 +144,54 @@ npm run dev
 
 ## Performance notes
 
-- The saved list no longer asks Supabase for a signed URL per item on
-  every poll. File links are stable same-origin paths that browsers can
-  cache, so images stop re-downloading every few seconds.
+What makes the first load quick, roughly in order of how much it matters:
+
+- **One request instead of three.** Opening the page used to call
+  `/api/config`, `/api/items` and `/api/saved` separately, and on a
+  serverless host each could be its own cold start. `/api/bootstrap` now
+  answers all of it at once, asking Redis and Supabase side by side.
+- **It starts before the app's code has loaded.** A tiny script in
+  `app/layout.tsx` fires that request the moment the HTML arrives, so the
+  answer is usually waiting by the time the page is ready to draw it.
+- **Only today, yesterday and pins are loaded.** Older saved items and
+  older live items stay on the server until you press **Show older
+  items**. Pinned items are always included, whatever their age.
+- **Files aren't downloaded just to draw the list.** The live list used to
+  carry every file's full contents (up to several MB each), on every page
+  load. Now it carries names and sizes only. A file's bytes are fetched
+  from `/api/items/<id>/content` when it's previewed, downloaded, saved
+  or sent, and the browser keeps what it has fetched.
+- **Fewer round trips to Redis.** Metadata for all live items is read in
+  one call (it was one call per item, one after another), and sharing an
+  item is one round trip instead of two.
+- **No bare "Loading…".** The list has its final shape from the first
+  paint (placeholder rows), and the rows themselves only re-render when
+  their own item changes, so typing in the search box stays smooth.
+- **Database indexes** for the two lists the home screen asks for (see
+  `supabase/schema.sql`).
+
+Things that were already in place:
+
+- The saved list doesn't ask Supabase for a signed URL per item on every
+  poll. File links are stable same-origin paths that browsers can cache,
+  so images stop re-downloading every few seconds.
 - Devices only re-fetch the saved list when something actually changed
   (a version counter in Redis), instead of on every poll.
 - Polling pauses while the tab is hidden, relaxes from 4 s to 12 s while
   nothing changes, and refreshes immediately when you come back.
-- Your last saved list is cached in the browser (`localStorage`, names
-  and text only, never file contents) so repeat visits paint instantly
-  while fresh data loads. Clearing site data clears it.
+- Your last list (today, yesterday and pins) is cached in the browser
+  (`localStorage`, names and text only, never file contents) so repeat
+  visits paint instantly while fresh data loads. Clearing site data
+  clears it.
 - The QR library and pairing UI load only when you open the pairing
   sheet.
+
+One thing no code change can do for you: keep your servers close to your
+data. In Vercel's project settings, set the **Function Region** to the
+region your Supabase project and Upstash database are in (their
+dashboards say where). If the function runs on another continent from
+the database, every query pays that distance, and for a phone on a slow
+connection it adds up.
 
 ## Known limits
 

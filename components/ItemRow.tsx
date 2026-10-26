@@ -1,9 +1,10 @@
 "use client";
 
+import { memo } from "react";
 import { DockItem } from "@/lib/types";
 import { formatBytes, formatTime } from "@/lib/format";
 import { downloadItem } from "@/lib/download";
-import { KindIcon, RestoreIcon, SendIcon, TrashIcon } from "./icons";
+import { KindIcon, PinIcon, RestoreIcon, SendIcon, TrashIcon } from "./icons";
 
 interface Props {
   item: DockItem;
@@ -12,6 +13,10 @@ interface Props {
   onCopy: (id: string) => void;
   /** Send straight to a paired device (opens the QR pairing if none yet). */
   onSend?: (id: string) => void;
+  /** Pinning needs permanent storage, so this is off when Supabase isn't set up. */
+  canPin?: boolean;
+  onPin?: (id: string) => void;
+  onUnpin?: (id: string) => void;
   /** Trash view: swaps Save/Remove for Restore/Delete forever. */
   variant?: "default" | "trash";
   onRestore?: (id: string) => void;
@@ -25,17 +30,23 @@ function previewUrl(item: DockItem): string | undefined {
   return undefined;
 }
 
-export default function ItemRow({
+function ItemRow({
   item,
   onSave,
   onRemove,
   onCopy,
   onSend,
+  canPin = false,
+  onPin,
+  onUnpin,
   variant = "default",
   onRestore,
   onPurge,
 }: Props) {
   const href = previewUrl(item);
+  const pinned = Boolean(item.pinnedAt) && variant !== "trash";
+  const pinLabel =
+    item.pinOp === "pin" ? "Pinning…" : item.pinOp === "unpin" ? "Unpinning…" : item.pinnedAt ? "Unpin" : "Pin";
 
   return (
     <div className="flex items-start gap-3 rounded-md border border-border bg-surface p-3">
@@ -45,7 +56,14 @@ export default function ItemRow({
 
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline justify-between gap-2">
-          <p className="truncate text-sm text-ink">{item.name}</p>
+          <p className="flex min-w-0 items-center gap-1.5 text-sm text-ink">
+            {pinned && (
+              <span className="shrink-0 text-accent" role="img" aria-label="Pinned">
+                <PinIcon filled />
+              </span>
+            )}
+            <span className="truncate">{item.name}</span>
+          </p>
           <span className="shrink-0 font-mono text-xs text-faint">{formatTime(item.createdAt)}</span>
         </div>
 
@@ -82,6 +100,26 @@ export default function ItemRow({
               >
                 <SendIcon />
                 Send
+              </button>
+            )}
+
+            {variant !== "trash" && canPin && (
+              <button
+                onClick={() => (item.pinnedAt ? onUnpin?.(item.id) : onPin?.(item.id))}
+                disabled={item.pinOp !== null || item.saving}
+                title={
+                  item.pinnedAt
+                    ? "Take this off the pinned list"
+                    : item.saved
+                      ? "Keep this at the top, however old it gets"
+                      : "Keep this at the top. It's saved first, so it isn't lost."
+                }
+                className={`flex items-center gap-1 text-xs disabled:cursor-not-allowed disabled:opacity-50 ${
+                  item.pinnedAt ? "font-medium text-accent hover:text-ink" : "text-muted hover:text-ink"
+                }`}
+              >
+                <PinIcon filled={Boolean(item.pinnedAt)} />
+                {pinLabel}
               </button>
             )}
 
@@ -137,6 +175,11 @@ export default function ItemRow({
     </div>
   );
 }
+
+// Rows only re-render when their own item changes. Typing in the search box,
+// or a poll that found nothing new, no longer repaints every row (and every
+// image) in the list.
+export default memo(ItemRow);
 
 function StatusBadge({ item, variant }: { item: DockItem; variant: "default" | "trash" }) {
   if (variant === "trash") {

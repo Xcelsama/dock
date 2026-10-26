@@ -1,20 +1,29 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Dropzone from "@/components/Dropzone";
 import TextComposer from "@/components/TextComposer";
 import ItemRow from "@/components/ItemRow";
+import ListSkeleton from "@/components/ListSkeleton";
 import TransferPrompts, { TransferPrompt } from "@/components/TransferPrompts";
 import { PairIcon } from "@/components/icons";
 import { usePeer } from "@/hooks/usePeer";
-import { DockItem, RelayRecord, SavedRecord } from "@/lib/types";
+import { Bootstrap, DockItem, LiveListing, RelayUpload, SavedRecord, SavedWindow } from "@/lib/types";
 import { blobForItem, itemFromRelay, itemFromSaved, makeItem } from "@/lib/items";
 import { kindFromFile, formatBytes } from "@/lib/format";
-import { fileToBase64, base64ToBlob } from "@/lib/base64";
+import { fileToBase64 } from "@/lib/base64";
 import { downloadItem } from "@/lib/download";
 import { extractFiles, hasFileItems } from "@/lib/clipboard";
 import { MAX_BROADCAST_BYTES } from "@/lib/relay-limits";
+import { startOfYesterday } from "@/lib/window";
+
+declare global {
+  interface Window {
+    /** The list request started by the inline script in app/layout.tsx. */
+    __dockBoot?: Promise<Bootstrap | null>;
+  }
+}
 
 // Loaded only when the pairing sheet is opened (it pulls in the QR library).
 const PairModal = dynamic(() => import("@/components/PairModal"), { ssr: false });
@@ -23,7 +32,9 @@ const POLL_MS = 4000;
 // While nothing changes, polling relaxes from 4s to 8s to 12s. Any activity,
 // or coming back to the tab, snaps it back to 4s.
 const MAX_IDLE_STEPS = 2;
-const SAVED_CACHE_KEY = "dock:saved:v1";
+// v2: the cache now holds the recent window plus pins, not a flat first page.
+const SAVED_CACHE_KEY = "dock:saved:v2";
+const OLD_SAVED_CACHE_KEY = "dock:saved:v1";
 const SHARE_LIVE_KEY = "dock:shareLive";
 const MAX_CACHE_CHARS = 300_000;
 const MAX_KNOWN_IDS = 150;
@@ -44,6 +55,7 @@ function textName(text: string) {
 
 function readSavedCache(): SavedRecord[] {
   try {
+    localStorage.removeItem(OLD_SAVED_CACHE_KEY);
     const raw = localStorage.getItem(SAVED_CACHE_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
     return Array.isArray(parsed) ? parsed : [];
@@ -62,6 +74,48 @@ function writeSavedCache(records: SavedRecord[]) {
   }
 }
 
+// Server data wins, but anything that only exists on this device (the File,
+// its blob URL) and anything mid-flight (saving, removing, pinning) is kept.
+function mergeSaved(existing: DockItem | undefined, row: SavedRecord): DockItem {
+  const fresh = itemFromSaved(row);
+  if (!existing) return fresh;
+  return {
+    ...fresh,
+    file: existing.file,
+    localUrl: existing.localUrl,
+    viaP2p: existing.viaP2p,
+    saving: existing.saving,
+    removing: existing.removing,
+    pinOp: existing.pinOp,
+    error: existing.error,
+    // A pin or unpin still on its way keeps the value the person just chose.
+    pinnedAt: existing.pinOp ? existing.pinnedAt : fresh.pinnedAt,
+  };
+}
+
+function fetchBootstrap(sinceIso: string): Promise<Bootstrap | null> {
+  return fetch(`/api/bootstrap?since=${encodeURIComponent(sinceIso)}`, { cache: "no-store" })
+    .then((r) => {
+      // The password was changed (or the cookie cleared) while this tab was
+      // open: the gate answered instead of the API. Go and unlock, rather
+      // than reporting a connection problem.
+      if (r.redirected && new URL(r.url).pathname === "/gate") {
+        window.location.assign(r.url);
+        return null;
+      }
+      return r.ok ? (r.json() as Promise<Bootstrap>) : null;
+    })
+    .catch(() => null);
+}
+
+// The inline script in app/layout.tsx usually has the request in flight (or
+// finished) before this code even runs. Use it once; otherwise ask now.
+function takeEarlyBootstrap(sinceIso: string): Promise<Bootstrap | null> {
+  const early = window.__dockBoot;
+  window.__dockBoot = undefined;
+  return early ?? fetchBootstrap(sinceIso);
+}
+
 export default function Page() {
   const [view, setView] = useState<"home" | "trash">("home");
   // Refs let long-lived listeners/timers (set up once) see current values
@@ -70,6 +124,8 @@ export default function Page() {
   viewRef.current = view;
 
   const [query, setQuery] = useState("");
+  // Typing stays instant; the list catches up a beat later.
+  const deferredQuery = useDeferredValue(query);
   const [ttlSeconds, setTtlSeconds] = useState(TTL_OPTIONS[1].value);
   const ttlRef = useRef(ttlSeconds);
   ttlRef.current = ttlSeconds;
@@ -91,6 +147,17 @@ export default function Page() {
   // When each item finished saving on this device, so a list fetched before
   // that moment can't mistake it for "gone from the server".
   const savedAtRef = useRef(new Map<string, number>());
+
+  // The home list covers today and yesterday (this device's calendar) plus
+  // pins. "Show older items" lifts that limit for the rest of the visit.
+  const [showOlder, setShowOlder] = useState(false);
+  const showOlderRef = useRef(showOlder);
+  showOlderRef.current = showOlder;
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [hasOlderLive, setHasOlderLive] = useState(false);
+  const [cutoffMs, setCutoffMs] = useState(() => startOfYesterday().getTime());
+  // Set when the last full load failed, so the next poll tries it again.
+  const needsReloadRef = useRef(false);
 
   const [trashItems, setTrashItems] = useState<Record<string, DockItem>>({});
   const [trashLoading, setTrashLoading] = useState(false);
@@ -132,89 +199,135 @@ export default function Page() {
 
   /* ---------------- loading & syncing ---------------- */
 
-  // Permanent list from our own API (never Supabase directly). A plain call
-  // refreshes the newest page and reconciles it, so items trashed or deleted
-  // on another device disappear here too; `more: true` pages further back.
-  const loadSaved = useCallback(
-    async (opts?: { more?: boolean }) => {
-      const more = opts?.more ?? false;
-      const before = more ? savedCursorRef.current : null;
-      const startedAt = Date.now();
-      const qs = new URLSearchParams();
-      if (before) qs.set("before", before);
+  // Folds the server's answer for the home list into local state: recent
+  // items, pins, and the removal of anything another device trashed or
+  // deleted. Items older than the window are only kept when they're pinned
+  // (or the person asked for older items).
+  const applySaved = useCallback((win: SavedWindow, startedAt: number) => {
+    setSupabaseConfigured(win.configured);
 
-      const res = await fetch(`/api/saved?${qs.toString()}`, { cache: "no-store" });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        if (body.error) setLoadError(body.error);
-        return;
+    const serverIds = new Set<string>();
+    for (const row of win.items) serverIds.add(row.id);
+    for (const row of win.pinned) serverIds.add(row.id);
+
+    // Everything newer than this was in the response in full. If the window
+    // was cut short, that's the oldest row we got, not the window's edge.
+    const coveredFrom = Math.max(Date.parse(win.since), Date.parse(win.nextBefore ?? win.since));
+
+    setItems((prev) => {
+      const next = { ...prev };
+      for (const row of win.items) next[row.id] = mergeSaved(prev[row.id], row);
+      for (const row of win.pinned) next[row.id] = mergeSaved(prev[row.id], row);
+
+      for (const item of Object.values(prev)) {
+        if (!item.saved || serverIds.has(item.id)) continue;
+        if (item.saving || item.removing || item.pinOp) continue;
+        if ((savedAtRef.current.get(item.id) ?? 0) >= startedAt) continue;
+
+        if (Date.parse(item.createdAt) >= coveredFrom) {
+          delete next[item.id]; // inside what we just fetched, so it's gone
+        } else if (!showOlderRef.current) {
+          delete next[item.id]; // outside the window, comes back on request
+        } else if (win.pinsReady && item.pinnedAt) {
+          next[item.id] = { ...item, pinnedAt: null }; // an older item that's no longer pinned
+        }
       }
-      setLoadError(null);
-      const { items: records, hasMore } = (await res.json()) as { items: SavedRecord[]; hasMore: boolean };
+      return next;
+    });
 
-      const serverIds = new Set(records.map((r) => r.id));
-      const oldest = records.length ? records[records.length - 1].createdAt : null;
+    const seen = new Set<string>();
+    const forCache: SavedRecord[] = [];
+    for (const row of [...win.items, ...win.pinned]) {
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        forCache.push(row);
+      }
+    }
+    writeSavedCache(forCache);
 
-      setItems((prev) => {
-        const next = { ...prev };
-        for (const row of records) {
-          const fresh = itemFromSaved(row);
-          const existing = prev[row.id];
-          next[row.id] = existing
-            ? {
-                ...fresh,
-                file: existing.file,
-                localUrl: existing.localUrl,
-                viaP2p: existing.viaP2p,
-                saving: existing.saving,
-                removing: existing.removing,
-                error: existing.error,
-              }
-            : fresh;
+    // Paging state belongs to the window until the person asks for older
+    // items; after that a refresh mustn't send them back to the start.
+    if (!showOlderRef.current) {
+      savedCursorRef.current = win.nextBefore;
+      setHasMoreSaved(win.hasMore);
+    }
+  }, []);
+
+  // `more: true` pages further back from the cursor ("Show older items").
+  // A plain call refreshes the home list: recent items plus pins. Resolves to
+  // whether it worked, so a failed refresh gets tried again.
+  const loadSaved = useCallback(
+    async (opts?: { more?: boolean }): Promise<boolean> => {
+      const more = opts?.more ?? false;
+      const startedAt = Date.now();
+
+      if (more) {
+        const before = savedCursorRef.current;
+        if (!before) return false;
+        const res = await fetch(`/api/saved?${new URLSearchParams({ before })}`, { cache: "no-store" });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          if (body.error) setLoadError(body.error);
+          return false;
         }
-        if (!more) {
-          for (const item of Object.values(prev)) {
-            if (!item.saved || serverIds.has(item.id) || item.saving || item.removing) continue;
-            if ((savedAtRef.current.get(item.id) ?? 0) >= startedAt) continue;
-            const inRange = !hasMore || (oldest !== null && Date.parse(item.createdAt) >= Date.parse(oldest));
-            if (inRange) delete next[item.id];
-          }
-        }
-        return next;
-      });
-
-      if (!more) writeSavedCache(records);
-      if (more || savedCursorRef.current === null) {
+        const { items: records, hasMore } = (await res.json()) as { items: SavedRecord[]; hasMore: boolean };
+        setItems((prev) => {
+          const next = { ...prev };
+          for (const row of records) next[row.id] = mergeSaved(prev[row.id], row);
+          return next;
+        });
         if (records.length) savedCursorRef.current = records[records.length - 1].createdAt;
         setHasMoreSaved(hasMore);
+        return true;
       }
+
+      const since = startOfYesterday().toISOString();
+      const res = await fetch(`/api/saved?since=${encodeURIComponent(since)}`, { cache: "no-store" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setLoadError(body.error ?? "Check your connection. Dock will keep trying.");
+        return false;
+      }
+      setLoadError(null);
+      applySaved((await res.json()) as SavedWindow, startedAt);
+      return true;
     },
-    []
+    [applySaved]
   );
 
-  // Pull whatever is currently live in the relay. Items already known
-  // locally are left alone so we don't clobber the File/object URL they carry.
+  // Adds live items we haven't seen. Items already known locally are left
+  // alone so we don't clobber the File/object URL they carry. Returns how
+  // many were new.
+  const applyLive = useCallback(
+    (live: LiveListing) => {
+      setLiveConfigured(live.configured);
+      setHasOlderLive(live.hasOlder);
+      let added = 0;
+      for (const record of live.items) {
+        if (itemsRef.current[record.id]) continue;
+        upsert(itemFromRelay(record), false);
+        added++;
+      }
+      return added;
+    },
+    [upsert]
+  );
+
+  // Pull whatever is currently live in the relay: metadata only, the file
+  // bytes stay put until someone opens or downloads the file.
   const loadLive = useCallback(async () => {
     const known = Object.values(itemsRef.current)
       .filter((i) => !i.saved)
       .slice(0, MAX_KNOWN_IDS)
       .map((i) => i.id);
-    const qs = known.length ? `?known=${known.join(",")}` : "";
-    const res = await fetch(`/api/items${qs}`, { cache: "no-store" });
+    const qs = new URLSearchParams();
+    if (known.length) qs.set("known", known.join(","));
+    if (!showOlderRef.current) qs.set("since", startOfYesterday().toISOString());
+    const res = await fetch(`/api/items?${qs.toString()}`, { cache: "no-store" });
     if (!res.ok) return { added: 0, savedVersion: null as number | null };
-    const { items: records, savedVersion } = (await res.json()) as {
-      items: RelayRecord[];
-      savedVersion: number | null;
-    };
-
-    let added = 0;
-    for (const record of records) {
-      if (itemsRef.current[record.id]) continue;
-      upsert(itemFromRelay(record), false);
-      added++;
-    }
-    return { added, savedVersion: typeof savedVersion === "number" ? savedVersion : null };
-  }, [upsert]);
+    const live = (await res.json()) as LiveListing;
+    return { added: applyLive(live), savedVersion: typeof live.savedVersion === "number" ? live.savedVersion : null };
+  }, [applyLive]);
 
   // One poll step. The saved list is only re-fetched when the server says
   // something in Supabase changed (or when forced), not on every tick.
@@ -223,7 +336,12 @@ export default function Page() {
       const { added, savedVersion } = await loadLive();
       const moved = savedVersion !== null && savedVersion !== lastVersionRef.current;
       if (savedVersion !== null) lastVersionRef.current = savedVersion;
-      if (force || moved) await loadSaved();
+      if (force || moved) {
+        // Stays set until a reload has actually worked, so a failed one
+        // (offline, server error) is tried again on the next tick.
+        needsReloadRef.current = true;
+        if (await loadSaved()) needsReloadRef.current = false;
+      }
       return added > 0 || moved;
     },
     [loadLive, loadSaved]
@@ -231,6 +349,32 @@ export default function Page() {
   const refreshRef = useRef(refresh);
   refreshRef.current = refresh;
   const pokeRef = useRef<() => void>(() => {});
+
+  // Lifts the two-day limit: pages further back through saved items and
+  // lists older live ones too.
+  const revealOlder = useCallback(async () => {
+    showOlderRef.current = true;
+    setShowOlder(true);
+    setLoadingOlder(true);
+    try {
+      await Promise.all([loadSaved({ more: true }), loadLive()]);
+    } catch {
+      // the button is still there to try again
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [loadSaved, loadLive]);
+
+  const loadMoreOlder = useCallback(async () => {
+    setLoadingOlder(true);
+    try {
+      await loadSaved({ more: true });
+    } catch {
+      // the button is still there to try again
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [loadSaved]);
 
   const loadTrash = useCallback(async (opts?: { more?: boolean }) => {
     const more = opts?.more ?? false;
@@ -267,18 +411,28 @@ export default function Page() {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
-    // Show last visit's saved list immediately, then update it from the network.
+    // The window moves at midnight, so keep it current.
+    const syncCutoff = () => {
+      const next = startOfYesterday().getTime();
+      setCutoffMs((prev) => (prev === next ? prev : next));
+    };
+
+    // Show last visit's list immediately, then update it from the network.
     try {
       setShareLive(localStorage.getItem(SHARE_LIVE_KEY) !== "0");
     } catch {}
     const cached = readSavedCache();
     if (cached.length) {
-      setItems((prev) => {
-        const next = { ...prev };
-        for (const row of cached) if (!next[row.id]) next[row.id] = itemFromSaved(row);
-        return next;
-      });
-      setLoading(false);
+      const cutoff = startOfYesterday().getTime();
+      const fresh = cached.filter((row) => row.pinnedAt || Date.parse(row.createdAt) >= cutoff);
+      if (fresh.length) {
+        setItems((prev) => {
+          const next = { ...prev };
+          for (const row of fresh) if (!next[row.id]) next[row.id] = itemFromSaved(row);
+          return next;
+        });
+        setLoading(false);
+      }
     }
 
     const schedule = (ms: number) => {
@@ -289,8 +443,9 @@ export default function Page() {
     async function tick() {
       if (cancelled) return;
       if (document.visibilityState === "visible" && viewRef.current === "home") {
+        syncCutoff();
         try {
-          const changed = await refreshRef.current(false);
+          const changed = await refreshRef.current(needsReloadRef.current);
           idleRef.current = changed ? 0 : Math.min(idleRef.current + 1, MAX_IDLE_STEPS);
         } catch {}
       }
@@ -300,6 +455,7 @@ export default function Page() {
     // Back on the tab, or after local activity: refresh now, then resume.
     const poke = () => {
       if (document.visibilityState !== "visible") return;
+      syncCutoff();
       idleRef.current = 0;
       clearTimeout(timer);
       refreshRef.current(true).catch(() => {}).finally(() => schedule(POLL_MS));
@@ -307,23 +463,25 @@ export default function Page() {
     pokeRef.current = poke;
 
     async function init() {
-      // All three requests start together instead of config first, then data.
-      const config = fetch("/api/config")
-        .then((r) => (r.ok ? r.json() : null))
-        .catch(() => null);
-      const live = loadLive()
-        .then(({ savedVersion }) => {
-          lastVersionRef.current = savedVersion;
-        })
-        .catch(() => {});
-      const saved = loadSaved().catch(() => {});
-      const cfg = await config;
-      if (cfg && !cancelled) {
-        setLiveConfigured(cfg.redisConfigured);
-        setSupabaseConfigured(cfg.supabaseConfigured);
+      const startedAt = Date.now();
+      const since = startOfYesterday().toISOString();
+      // One request covers the relay, the recent saved items and the pins.
+      // It usually started before this code loaded (see app/layout.tsx).
+      let data = await takeEarlyBootstrap(since);
+      if (!data && !cancelled) data = await fetchBootstrap(since);
+      if (cancelled) return;
+
+      if (data) {
+        lastVersionRef.current = data.live.savedVersion;
+        applyLive(data.live);
+        applySaved(data.saved, startedAt);
+        setLoadError(null);
+        needsReloadRef.current = false;
+      } else {
+        needsReloadRef.current = true;
+        setLoadError("Check your connection. Dock will keep trying.");
       }
-      await Promise.all([live, saved]);
-      if (!cancelled) setLoading(false);
+      setLoading(false);
       schedule(POLL_MS);
     }
     void init();
@@ -342,7 +500,7 @@ export default function Page() {
   /* ---------------- adding things ---------------- */
 
   const broadcast = useCallback(
-    async (record: RelayRecord, itemTtlSeconds: number) => {
+    async (record: RelayUpload, itemTtlSeconds: number) => {
       try {
         const res = await fetch("/api/items", {
           method: "POST",
@@ -603,8 +761,10 @@ export default function Page() {
 
   /* ---------------- save / remove / trash ---------------- */
 
+  // `pin: true` saves and pins in one request, so pinning something that was
+  // only live (or only on this device) doesn't need a second round trip.
   const saveItem = useCallback(
-    async (id: string) => {
+    async (id: string, opts: { pin?: boolean } = {}) => {
       const item = itemsRef.current[id];
       if (!item || item.saved || item.saving) return;
 
@@ -613,7 +773,8 @@ export default function Page() {
         return;
       }
 
-      patchItem(id, { saving: true, error: null });
+      const pin = opts.pin ?? false;
+      patchItem(id, { saving: true, error: null, ...(pin ? { pinOp: "pin" as const } : {}) });
 
       try {
         const form = new FormData();
@@ -623,12 +784,14 @@ export default function Page() {
         form.set("kind", item.kind);
         form.set("name", item.name);
         if (item.mime) form.set("mime", item.mime);
+        if (pin) form.set("pinned", "1");
 
         if (item.kind === "text" && item.text) {
           form.set("textContent", item.text);
         } else {
-          const blob: File | Blob | null = item.file ?? (item.content ? base64ToBlob(item.content, item.mime) : null);
-          if (blob) form.set("file", blob, item.name);
+          // From this device it's the File itself; from another device it's
+          // still in the relay, so its bytes are fetched now.
+          form.set("file", await blobForItem(item), item.name);
         }
 
         const res = await fetch("/api/saved", { method: "POST", body: form });
@@ -645,7 +808,9 @@ export default function Page() {
         patchItem(id, {
           saved: true,
           saving: false,
+          pinOp: null,
           deletedAt: null,
+          pinnedAt: saved.pinnedAt ?? null,
           remoteUrl: saved.remoteUrl,
           storageId: saved.id,
           viaP2p: false,
@@ -655,10 +820,73 @@ export default function Page() {
           fetch(`/api/items/${id}`, { method: "DELETE" }).catch(() => {});
         }
       } catch (err) {
-        patchItem(id, { saving: false, error: err instanceof Error ? err.message : "Save failed" });
+        patchItem(id, {
+          saving: false,
+          pinOp: null,
+          error: err instanceof Error ? err.message : "Save failed",
+        });
       }
     },
     [patchItem, supabaseConfigured]
+  );
+
+  // Pinning keeps an item at the top of the list however old it gets, so it
+  // has to live somewhere permanent: an unsaved item is saved as it's pinned.
+  const pinItem = useCallback(
+    async (id: string) => {
+      const item = itemsRef.current[id];
+      if (!item || item.pinnedAt || item.pinOp || item.saving) return;
+
+      if (!supabaseConfigured) {
+        patchItem(id, { error: "Pinning needs Supabase, which isn't set up yet." });
+        return;
+      }
+      if (!item.saved) {
+        await saveItem(id, { pin: true });
+        return;
+      }
+      if (!item.storageId) return;
+
+      // Shown as pinned straight away, put back if the server says no.
+      const optimistic = new Date().toISOString();
+      patchItem(id, { pinOp: "pin", pinnedAt: optimistic, error: null });
+      try {
+        const res = await fetch(`/api/saved/${item.storageId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "pin" }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error ?? "Couldn't pin that.");
+        patchItem(id, { pinOp: null, pinnedAt: (body.item as SavedRecord | undefined)?.pinnedAt ?? optimistic });
+      } catch (err) {
+        patchItem(id, { pinOp: null, pinnedAt: null, error: err instanceof Error ? err.message : "Couldn't pin that." });
+      }
+    },
+    [patchItem, saveItem, supabaseConfigured]
+  );
+
+  const unpinItem = useCallback(
+    async (id: string) => {
+      const item = itemsRef.current[id];
+      if (!item || !item.pinnedAt || item.pinOp || !item.storageId) return;
+
+      const previous = item.pinnedAt;
+      patchItem(id, { pinOp: "unpin", pinnedAt: null, error: null });
+      try {
+        const res = await fetch(`/api/saved/${item.storageId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "unpin" }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error ?? "Couldn't unpin that.");
+        patchItem(id, { pinOp: null, pinnedAt: null });
+      } catch (err) {
+        patchItem(id, { pinOp: null, pinnedAt: previous, error: err instanceof Error ? err.message : "Couldn't unpin that." });
+      }
+    },
+    [patchItem]
   );
 
   // For a not-yet-saved item, Remove just clears it (it was never
@@ -761,10 +989,25 @@ export default function Page() {
 
   /* ---------------- render ---------------- */
 
-  const q = query.trim().toLowerCase();
-  const ordered = Object.values(items)
-    .filter((item) => !q || item.name.toLowerCase().includes(q) || (item.text?.toLowerCase().includes(q) ?? false))
-    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  const q = deferredQuery.trim().toLowerCase();
+
+  // Pins first (most recently pinned on top), then everything from today and
+  // yesterday, newest first. Rebuilt only when something it depends on moves.
+  const { pinnedList, recentList } = useMemo(() => {
+    const pinned: DockItem[] = [];
+    const recent: DockItem[] = [];
+    for (const item of Object.values(items)) {
+      if (q && !item.name.toLowerCase().includes(q) && !(item.text?.toLowerCase().includes(q) ?? false)) continue;
+      if (item.pinnedAt) pinned.push(item);
+      else if (showOlder || Date.parse(item.createdAt) >= cutoffMs) recent.push(item);
+    }
+    pinned.sort((a, b) => Date.parse(b.pinnedAt as string) - Date.parse(a.pinnedAt as string));
+    recent.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+    return { pinnedList: pinned, recentList: recent };
+  }, [items, q, showOlder, cutoffMs]);
+
+  const canShowOlder = !showOlder && (hasMoreSaved || hasOlderLive);
+  const canLoadMore = showOlder && hasMoreSaved;
 
   const orderedTrash = Object.values(trashItems).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 
@@ -895,16 +1138,23 @@ export default function Page() {
             </div>
           </div>
 
-          <section className="flex flex-col gap-2">
+          <section className="flex flex-col gap-2" aria-busy={loading}>
             {loading ? (
-              <p className="py-6 text-center text-sm text-faint">Loading…</p>
-            ) : ordered.length === 0 ? (
-              <p className="py-6 text-center text-sm text-faint">
-                {q ? "No items match your search." : "Nothing here yet. Drop, paste, or add something above."}
-              </p>
+              <ListSkeleton />
             ) : (
               <>
-                {ordered.map((item) => (
+                {pinnedList.length === 0 && recentList.length === 0 && (
+                  <p className="py-6 text-center text-sm text-faint">
+                    {q
+                      ? showOlder
+                        ? "No items match your search."
+                        : "Nothing from today or yesterday matches your search."
+                      : "Nothing from today or yesterday. Drop, paste, or add something above."}
+                  </p>
+                )}
+
+                {pinnedList.length > 0 && <h2 className="text-xs font-medium text-muted">Pinned</h2>}
+                {pinnedList.map((item) => (
                   <ItemRow
                     key={item.id}
                     item={item}
@@ -912,14 +1162,38 @@ export default function Page() {
                     onRemove={removeItem}
                     onCopy={copyText}
                     onSend={sendItem}
+                    canPin={supabaseConfigured}
+                    onPin={pinItem}
+                    onUnpin={unpinItem}
                   />
                 ))}
-                {hasMoreSaved && !q && (
+
+                {pinnedList.length > 0 && recentList.length > 0 && (
+                  <h2 className="mt-2 text-xs font-medium text-muted">
+                    {showOlder ? "Everything else" : "Today and yesterday"}
+                  </h2>
+                )}
+                {recentList.map((item) => (
+                  <ItemRow
+                    key={item.id}
+                    item={item}
+                    onSave={saveItem}
+                    onRemove={removeItem}
+                    onCopy={copyText}
+                    onSend={sendItem}
+                    canPin={supabaseConfigured}
+                    onPin={pinItem}
+                    onUnpin={unpinItem}
+                  />
+                ))}
+
+                {(canShowOlder || canLoadMore) && (
                   <button
-                    onClick={() => loadSaved({ more: true })}
-                    className="mx-auto mt-2 text-xs text-muted underline underline-offset-2 hover:text-ink"
+                    onClick={canShowOlder ? revealOlder : loadMoreOlder}
+                    disabled={loadingOlder}
+                    className="mx-auto mt-2 text-xs text-muted underline underline-offset-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    Load older saved items
+                    {loadingOlder ? "Loading…" : canShowOlder ? "Show older items" : "Load more"}
                   </button>
                 )}
               </>

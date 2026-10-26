@@ -40,5 +40,20 @@ export function toSavedRecord(row: any): SavedRecord {
     // so the browser can cache it. The route behind it mints the signed URL.
     remoteUrl: row.storage_path ? `/api/saved/${row.id}/file` : null,
     deletedAt: row.deleted_at,
+    pinnedAt: row.pinned_at ?? null,
   };
 }
+
+// Postgres "undefined column" (42703), or PostgREST's schema-cache version of
+// it (PGRST204). Both mean the one-time pin migration hasn't been run yet.
+export function isMissingPinColumn(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  return (
+    error.code === "42703" ||
+    error.code === "PGRST204" ||
+    (typeof error.message === "string" && error.message.includes("pinned_at"))
+  );
+}
+
+export const PIN_MIGRATION_MESSAGE =
+  "Pinning needs a one-time database update. Run supabase/pin-migration.sql in the Supabase SQL editor (see the README).";

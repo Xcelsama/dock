@@ -1,12 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseAdmin, BUCKET, TABLE, toSavedRecord } from "@/lib/supabase-admin";
+import {
+  supabaseAdmin,
+  BUCKET,
+  TABLE,
+  toSavedRecord,
+  UUID_RE,
+  isMissingPinColumn,
+  PIN_MIGRATION_MESSAGE,
+} from "@/lib/supabase-admin";
 import { bumpSavedVersion } from "@/lib/redis";
 
-// PATCH /api/saved/[id] — { action: "trash" | "restore" }
-// Soft-delete only. The row and its file stay put; deleted_at just
-// hides it from the normal list and shows it in Trash instead, so an
-// accidental Remove doesn't permanently destroy something you saved on
-// purpose.
+// PATCH /api/saved/[id] — { action: "trash" | "restore" | "pin" | "unpin" }
+// Trash and restore are soft-delete only. The row and its file stay put;
+// deleted_at just hides it from the normal list and shows it in Trash
+// instead, so an accidental Remove doesn't permanently destroy something
+// you saved on purpose.
+//
+// Pin and unpin set or clear pinned_at. Pinned items are always loaded at
+// the top of the list, however old they are. Trashing a pinned item keeps
+// its pin, so Restore puts it back where it was.
 export async function PATCH(
   req: NextRequest,
   { params }: { params: { id: string } }
@@ -17,27 +29,36 @@ export async function PATCH(
       { status: 503 }
     );
   }
+  if (!UUID_RE.test(params.id)) {
+    return NextResponse.json({ error: "Not found." }, { status: 404 });
+  }
 
   const body = await req.json().catch(() => null);
   const action = body?.action;
-  if (action !== "trash" && action !== "restore") {
+  if (action !== "trash" && action !== "restore" && action !== "pin" && action !== "unpin") {
     return NextResponse.json({ error: "Invalid action." }, { status: 400 });
   }
 
-  const deleted_at = action === "trash" ? new Date().toISOString() : null;
+  const isPinAction = action === "pin" || action === "unpin";
+  const patch: Record<string, string | null> = isPinAction
+    ? { pinned_at: action === "pin" ? new Date().toISOString() : null }
+    : { deleted_at: action === "trash" ? new Date().toISOString() : null };
 
-  const { data, error } = await supabaseAdmin
-    .from(TABLE)
-    .update({ deleted_at })
-    .eq("id", params.id)
-    .select()
-    .single();
+  let query = supabaseAdmin.from(TABLE).update(patch).eq("id", params.id);
+  // A trashed item can't be pinned; restore it first.
+  if (isPinAction) query = query.is("deleted_at", null);
+
+  const { data, error } = await query.select().maybeSingle();
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    const message = isPinAction && isMissingPinColumn(error) ? PIN_MIGRATION_MESSAGE : error.message;
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+  if (!data) {
+    return NextResponse.json({ error: "That item isn't in Dock any more." }, { status: 404 });
   }
 
-  bumpSavedVersion();
+  await bumpSavedVersion();
   return NextResponse.json({ item: toSavedRecord(data) });
 }
 
@@ -67,6 +88,6 @@ export async function DELETE(
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  bumpSavedVersion();
+  await bumpSavedVersion();
   return NextResponse.json({ ok: true });
 }

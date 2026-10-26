@@ -3,64 +3,34 @@ import {
   redis,
   INDEX_KEY,
   ITEM_PREFIX,
-  SAVED_VERSION_KEY,
+  BLOB_PREFIX,
   TTL_SECONDS,
+  MAX_TTL_SECONDS,
   clampTtl,
 } from "@/lib/redis";
 import { MAX_BROADCAST_BYTES } from "@/lib/relay-limits";
-import { RelayRecord } from "@/lib/types";
+import { listLive, StoredItem } from "@/lib/live-list";
+import { RelayUpload } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-// Items that the client is missing are fetched one at a time up to this
-// budget. A single giant mget blew past Upstash's 10 MB request cap when
-// the backlog got big; whatever doesn't fit this round is picked up on the
-// next poll, so it self-heals.
-const SAFE_RESPONSE_BYTES = 7 * 1024 * 1024;
-
+// GET /api/items?known=<ids>&since=<ISO>
+// Lists what's live as metadata only. The file bytes are not in this
+// response: they're fetched from /api/items/<id>/content when a file is
+// opened, previewed or downloaded. That keeps a poll tiny however many large
+// files are sitting in the relay, and means a fresh page load no longer
+// downloads every live file just to draw the list.
 export async function GET(req: NextRequest) {
-  if (!redis) {
-    return NextResponse.json({ items: [] as RelayRecord[], savedVersion: null });
-  }
+  const params = req.nextUrl.searchParams;
 
-  // One round trip for both the id list and the saved-version counter.
-  const [ids, version] = await redis
-    .pipeline()
-    .zrange(INDEX_KEY, 0, -1, { rev: true })
-    .get(SAVED_VERSION_KEY)
-    .exec<[string[], number | null]>();
+  // The client sends the ids it already holds (?known=) so we only describe
+  // what it's missing.
+  const known = new Set((params.get("known") ?? "").split(",").filter(Boolean));
+  const sinceParam = params.get("since");
+  const since = sinceParam ? Date.parse(sinceParam) : null;
 
-  const savedVersion = Number(version ?? 0);
-
-  // The client sends the ids it already holds (?known=) so we only fetch
-  // bodies it's actually missing.
-  const knownParam = req.nextUrl.searchParams.get("known") ?? "";
-  const known = new Set(knownParam.split(",").filter(Boolean));
-  const missingIds = ids.filter((id) => !known.has(id));
-
-  const items: RelayRecord[] = [];
-  const stale: string[] = [];
-  let approxBytes = 0;
-
-  for (const id of missingIds) {
-    if (approxBytes >= SAFE_RESPONSE_BYTES) break;
-
-    const value = await redis.get<RelayRecord | null>(`${ITEM_PREFIX}${id}`);
-    if (!value) {
-      stale.push(id);
-      continue;
-    }
-    items.push(value);
-    approxBytes += JSON.stringify(value).length;
-  }
-
-  // Redis already expired the stray keys via TTL, this just tidies the
-  // index. Not awaited on purpose.
-  if (stale.length) {
-    redis.zrem(INDEX_KEY, ...stale).catch(() => {});
-  }
-
-  return NextResponse.json({ items, savedVersion });
+  const listing = await listLive({ since: Number.isFinite(since) ? since : null, known });
+  return NextResponse.json(listing);
 }
 
 export async function POST(req: NextRequest) {
@@ -77,7 +47,7 @@ export async function POST(req: NextRequest) {
   }
 
   const { id, kind, name, size, mime, createdAt, text, content, ttlSeconds } =
-    body as Partial<RelayRecord> & { ttlSeconds?: number };
+    body as Partial<RelayUpload> & { ttlSeconds?: number };
 
   if (!id || !kind || !name || !createdAt) {
     return NextResponse.json({ error: "Missing fields." }, { status: 400 });
@@ -87,7 +57,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Too large to share live." }, { status: 413 });
   }
 
-  const record: RelayRecord = {
+  const record: StoredItem = {
     id,
     kind,
     name,
@@ -95,18 +65,24 @@ export async function POST(req: NextRequest) {
     mime: mime ?? null,
     createdAt,
     text: text ?? null,
-    content: content ?? null,
+    hasContent: Boolean(content),
   };
 
   // Clamped server-side so a tampered request can't pin an item in Redis
   // indefinitely or expire it instantly.
   const ttl = ttlSeconds !== undefined ? clampTtl(ttlSeconds) : TTL_SECONDS;
 
-  await redis.set(`${ITEM_PREFIX}${id}`, record, { ex: ttl });
-  await redis.zadd(INDEX_KEY, {
-    score: Date.parse(createdAt) || Date.now(),
-    member: id,
-  });
+  // One round trip for everything. The bytes go in first, so by the time an
+  // id shows up in the index its file is already there. The last command
+  // sweeps ids older than the longest possible TTL (a day of slack on top):
+  // those items are certainly gone, and the windowed list never looks that
+  // far back to notice.
+  const pipe = redis.pipeline();
+  if (content) pipe.set(`${BLOB_PREFIX}${id}`, { c: content }, { ex: ttl });
+  pipe.set(`${ITEM_PREFIX}${id}`, record, { ex: ttl });
+  pipe.zadd(INDEX_KEY, { score: Date.parse(createdAt) || Date.now(), member: id });
+  pipe.zremrangebyscore(INDEX_KEY, "-inf", Date.now() - (MAX_TTL_SECONDS + 24 * 60 * 60) * 1000);
+  await pipe.exec();
 
   return NextResponse.json({ ok: true });
 }

@@ -12,8 +12,10 @@ export function makeItem(init: Required & Partial<DockItem>): DockItem {
     broadcast: false,
     viaP2p: false,
     deletedAt: null,
+    pinnedAt: null,
     saving: false,
     removing: false,
+    pinOp: null,
     error: null,
     localUrl: null,
     file: null,
@@ -35,6 +37,7 @@ export function itemFromSaved(row: SavedRecord): DockItem {
     createdAt: row.createdAt,
     saved: true,
     deletedAt: row.deletedAt,
+    pinnedAt: row.pinnedAt ?? null,
     text: row.textContent,
     remoteUrl: row.remoteUrl,
     storageId: row.id,
@@ -51,7 +54,9 @@ export function itemFromRelay(record: RelayRecord): DockItem {
     createdAt: record.createdAt,
     broadcast: true,
     text: record.text,
-    content: record.content,
+    // The bytes aren't in the list. They load from this URL when the file is
+    // previewed, downloaded, saved or sent.
+    remoteUrl: record.hasContent ? `/api/items/${record.id}/content` : null,
   });
 }
 
@@ -61,7 +66,7 @@ export async function blobForItem(item: DockItem): Promise<Blob> {
   if (item.content) return base64ToBlob(item.content, item.mime);
   if (item.remoteUrl) {
     const res = await fetch(item.remoteUrl);
-    if (!res.ok) throw new Error("Couldn't load the file to send it");
+    if (!res.ok) throw new Error("Couldn't load that file. It may have expired.");
     return res.blob();
   }
   throw new Error("Nothing to send");

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { redis, INDEX_KEY, ITEM_PREFIX } from "@/lib/redis";
+import { redis, INDEX_KEY, ITEM_PREFIX, BLOB_PREFIX } from "@/lib/redis";
 
 export async function DELETE(
   _req: NextRequest,
@@ -8,7 +8,12 @@ export async function DELETE(
   if (!redis) {
     return NextResponse.json({ ok: true });
   }
-  await redis.del(`${ITEM_PREFIX}${params.id}`);
-  await redis.zrem(INDEX_KEY, params.id);
+  // Metadata, bytes and index entry go in one round trip.
+  await redis
+    .pipeline()
+    .del(`${ITEM_PREFIX}${params.id}`)
+    .del(`${BLOB_PREFIX}${params.id}`)
+    .zrem(INDEX_KEY, params.id)
+    .exec();
   return NextResponse.json({ ok: true });
 }
