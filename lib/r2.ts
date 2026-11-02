@@ -25,7 +25,9 @@ export async function r2Put(key: string, bytes: Uint8Array, contentType?: string
   if (!aws) throw new Error("File storage isn't configured.");
   const res = await aws.fetch(`${base}/${key}`, {
     method: "PUT",
-    body: bytes,
+    // Copy into a plain ArrayBuffer-backed array. Newer TypeScript types
+    // Uint8Array as possibly SharedArrayBuffer-backed, which fetch's body rejects.
+    body: new Uint8Array(bytes),
     headers: {
       "Content-Type": contentType || "application/octet-stream",
       "Cache-Control": "private, max-age=31536000, immutable",
