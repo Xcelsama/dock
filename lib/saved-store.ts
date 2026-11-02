@@ -115,7 +115,9 @@ export async function listPage(opts: {
   limit: number;
 }): Promise<{ items: SavedRow[]; hasMore: boolean }> {
   const key = opts.trash ? TRASH : IDX;
-  const max = opts.before ? `(${Date.parse(opts.before)}` : "+inf";
+  // Upstash only takes a score bound shaped like "(123" (exclusive) or "+inf",
+  // not just any string, so we tell TypeScript exactly which shapes `max` can be.
+  const max: `(${number}` | "+inf" = opts.before ? `(${Date.parse(opts.before)}` : "+inf";
   const ids = await r().zrange<string[]>(key, max, "-inf", {
     byScore: true,
     rev: true,
