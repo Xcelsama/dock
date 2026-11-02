@@ -1,45 +1,35 @@
 import { NextRequest, NextResponse } from "next/server";
+import { r2Put } from "@/lib/r2";
 import {
-  supabaseAdmin,
-  BUCKET,
-  TABLE,
-  UUID_RE,
+  savedConfigured,
+  createSaved,
+  getSaved,
+  listPage,
   toSavedRecord,
-  isMissingPinColumn,
-  PIN_MIGRATION_MESSAGE,
-} from "@/lib/supabase-admin";
+  UUID_RE,
+  type SavedRow,
+} from "@/lib/saved-store";
 import { bumpSavedVersion } from "@/lib/redis";
 import { listSavedWindow, parseSince } from "@/lib/saved-list";
 import { ItemKind } from "@/lib/types";
 
 const DEFAULT_PAGE_SIZE = 30;
 const MAX_PAGE_SIZE = 100;
+// Text lives in Redis, whose request size is limited; files have no such limit here.
+const MAX_TEXT_BYTES = 500_000;
 
 function safeName(name: string) {
   return name.replace(/[^\w.\-]+/g, "_");
 }
 
 function isItemKind(value: unknown): value is ItemKind {
-  return (
-    value === "text" ||
-    value === "image" ||
-    value === "pdf" ||
-    value === "zip" ||
-    value === "file"
-  );
+  return value === "text" || value === "image" || value === "pdf" || value === "zip" || value === "file";
 }
 
-// GET /api/saved?since=<ISO>
-//   The home screen's list: items created on/after `since`, plus every
-//   pinned item whatever its age (see lib/saved-list.ts).
-// GET /api/saved?limit=30&before=<ISO timestamp>&trash=1
-//   Cursor-based pagination on created_at: pass the createdAt of the last
-//   item you already have as `before` to get the next page. Used for "Show
-//   older items" and for Trash.
-// No signed URLs are minted here (that was one Supabase round trip per item
-// per poll); files are reached through /api/saved/[id]/file instead.
+// GET /api/saved?since=<ISO>                      home list (recent window + pins)
+// GET /api/saved?limit=30&before=<ISO>&trash=1    paged list / Trash
 export async function GET(req: NextRequest) {
-  if (!supabaseAdmin) {
+  if (!savedConfigured) {
     return NextResponse.json({ items: [], hasMore: false });
   }
 
@@ -50,60 +40,35 @@ export async function GET(req: NextRequest) {
   const since = parseSince(searchParams.get("since"));
   if (since && !trash && !before) {
     const result = await listSavedWindow(since);
-    if (!result.ok) {
-      return NextResponse.json({ error: result.error }, { status: 500 });
-    }
+    if (!result.ok) return NextResponse.json({ error: result.error }, { status: 500 });
     return NextResponse.json(result.window);
   }
 
-  const limit = Math.min(
-    MAX_PAGE_SIZE,
-    Math.max(1, Number(searchParams.get("limit")) || DEFAULT_PAGE_SIZE)
-  );
+  const limit = Math.min(MAX_PAGE_SIZE, Math.max(1, Number(searchParams.get("limit")) || DEFAULT_PAGE_SIZE));
 
-  let query = supabaseAdmin
-    .from(TABLE)
-    .select("*")
-    .order("created_at", { ascending: false })
-    .limit(limit + 1); // fetch one extra to know if there's a next page
-
-  query = trash ? query.not("deleted_at", "is", null) : query.is("deleted_at", null);
-  if (before) query = query.lt("created_at", before);
-
-  const { data, error } = await query;
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  try {
+    const { items, hasMore } = await listPage({ trash, before, limit });
+    return NextResponse.json({ items: items.map(toSavedRecord), hasMore });
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Couldn't load items." },
+      { status: 500 }
+    );
   }
-
-  const rows = data ?? [];
-  const hasMore = rows.length > limit;
-  const page = hasMore ? rows.slice(0, limit) : rows;
-
-  return NextResponse.json({ items: page.map(toSavedRecord), hasMore });
 }
 
 // POST /api/saved — multipart/form-data.
-// Fields: id (optional client uuid, keeps the item's identity stable
-// across "local" -> "saved"), kind, name, mime (optional), textContent
-// (optional), file (optional binary), pinned ("1" to pin it as it's saved).
-// Everything goes through the service-role client server-side.
-//
-// Note: on Vercel a request body is capped at ~4.5 MB, so larger files
-// can't be saved through this route (the client shows a clear message).
+// Fields: id (optional client uuid), kind, name, mime, textContent, file, pinned ("1").
+// Note: on Vercel a request body is capped at ~4.5 MB.
 export async function POST(req: NextRequest) {
-  if (!supabaseAdmin) {
-    return NextResponse.json(
-      { error: "Supabase isn't configured yet." },
-      { status: 503 }
-    );
+  if (!savedConfigured) {
+    return NextResponse.json({ error: "Storage isn't configured yet." }, { status: 503 });
   }
 
   const form = await req.formData().catch(() => null);
-  if (!form) {
-    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
-  }
+  if (!form) return NextResponse.json({ error: "Invalid request." }, { status: 400 });
 
-  const id = form.get("id");
+  const idRaw = form.get("id");
   const kind = form.get("kind");
   const name = form.get("name");
   const mime = form.get("mime");
@@ -115,53 +80,58 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Missing fields." }, { status: 400 });
   }
 
+  const id = typeof idRaw === "string" && UUID_RE.test(idRaw) ? idRaw : crypto.randomUUID();
+
+  // Saving the same item twice returns what's already there.
+  const existing = await getSaved(id).catch(() => null);
+  if (existing) return NextResponse.json({ item: toSavedRecord(existing) });
+
   let storagePath: string | null = null;
   let size = 0;
+  const mimeStr = typeof mime === "string" && mime ? mime : null;
 
   if (file instanceof File) {
-    storagePath = `${Date.now()}-${safeName(name)}`;
+    storagePath = `${id}/${safeName(name)}`;
     const bytes = new Uint8Array(await file.arrayBuffer());
     size = bytes.byteLength;
-    const { error: uploadError } = await supabaseAdmin.storage
-      .from(BUCKET)
-      .upload(storagePath, bytes, {
-        contentType: typeof mime === "string" && mime ? mime : file.type || undefined,
-        // Paths are unique per upload and never overwritten, so the bytes
-        // are safe for browsers to cache for a long time.
-        cacheControl: "31536000",
-        upsert: false,
-      });
-    if (uploadError) {
-      return NextResponse.json({ error: uploadError.message }, { status: 500 });
+    try {
+      await r2Put(storagePath, bytes, mimeStr || file.type || undefined);
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : "Upload failed." },
+        { status: 500 }
+      );
     }
   } else if (typeof textContent === "string") {
     size = new Blob([textContent]).size;
+    if (size > MAX_TEXT_BYTES) {
+      return NextResponse.json(
+        { error: "That text is too long to save (limit about 500 KB). Save it as a file instead." },
+        { status: 413 }
+      );
+    }
   }
 
-  const { data, error: insertError } = await supabaseAdmin
-    .from(TABLE)
-    .insert({
-      ...(typeof id === "string" && UUID_RE.test(id) ? { id } : {}),
-      kind,
-      name,
-      size,
-      mime: typeof mime === "string" && mime ? mime : null,
-      storage_path: storagePath,
-      text_content: typeof textContent === "string" ? textContent : null,
-      ...(pinned ? { pinned_at: new Date().toISOString() } : {}),
-    })
-    .select()
-    .single();
+  const now = new Date().toISOString();
+  const row: SavedRow = {
+    id,
+    kind,
+    name,
+    size,
+    mime: mimeStr,
+    storagePath,
+    textContent: typeof textContent === "string" ? textContent : null,
+    createdAt: now,
+    deletedAt: null,
+    pinnedAt: pinned ? now : null,
+  };
 
-  if (insertError) {
-    // Don't leave an orphaned file behind if the row couldn't be written.
-    if (storagePath) {
-      await supabaseAdmin.storage.from(BUCKET).remove([storagePath]);
-    }
-    const message = pinned && isMissingPinColumn(insertError) ? PIN_MIGRATION_MESSAGE : insertError.message;
-    return NextResponse.json({ error: message }, { status: 500 });
+  try {
+    await createSaved(row);
+  } catch (err) {
+    return NextResponse.json({ error: err instanceof Error ? err.message : "Save failed." }, { status: 500 });
   }
 
   await bumpSavedVersion();
-  return NextResponse.json({ item: toSavedRecord(data) });
+  return NextResponse.json({ item: toSavedRecord(row) });
 }

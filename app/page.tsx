@@ -769,7 +769,7 @@ export default function Page() {
       if (!item || item.saved || item.saving) return;
 
       if (!supabaseConfigured) {
-        patchItem(id, { error: "Supabase isn't configured yet." });
+        patchItem(id, { error: "Storage isn't configured yet." });
         return;
       }
 
@@ -838,7 +838,7 @@ export default function Page() {
       if (!item || item.pinnedAt || item.pinOp || item.saving) return;
 
       if (!supabaseConfigured) {
-        patchItem(id, { error: "Pinning needs Supabase, which isn't set up yet." });
+        patchItem(id, { error: "Pinning needs storage, which isn't set up yet." });
         return;
       }
       if (!item.saved) {
@@ -1065,7 +1065,7 @@ export default function Page() {
 
       {!supabaseConfigured && (
         <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
-          Supabase isn&apos;t configured, so Save and Trash are disabled. Live sharing still works without it.
+          Storage isn&apos;t configured, so Save and Trash are disabled. Live sharing still works without it.
         </div>
       )}
 
@@ -1095,6 +1095,12 @@ export default function Page() {
         >
           Trash{orderedTrash.length ? ` (${orderedTrash.length})` : ""}
         </button>
+        <a
+          href="/legacy"
+          className="-mb-px ml-auto border-b-2 border-transparent px-3 py-2 text-muted hover:text-ink"
+        >
+          Old files
+        </a>
       </nav>
 
       {view === "home" ? (

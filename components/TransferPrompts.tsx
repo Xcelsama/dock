@@ -98,7 +98,7 @@ export default function TransferPrompts({ prompts, items, canSave, onSave, onDow
                   </button>
                 </div>
                 {!canSave && (
-                  <p className="mt-2 text-xs text-faint">Saving isn&apos;t set up (Supabase), so download it to keep it.</p>
+                  <p className="mt-2 text-xs text-faint">Saving isn&apos;t set up, so download it to keep it.</p>
                 )}
                 {item.error && <p className="mt-2 text-xs text-warn">{item.error}</p>}
               </>
